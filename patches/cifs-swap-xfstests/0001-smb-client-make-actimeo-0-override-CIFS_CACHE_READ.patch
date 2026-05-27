@@ -1,0 +1,91 @@
+From 0025433e269302f2ae249695e6077338d8abcf61 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 28 May 2026 16:19:31 +0800
+Subject: [PATCH] smb: client: make actimeo=0 override CIFS_CACHE_READ
+
+A mount with actimeo=0 disables CIFS attribute caching, so getattr-style
+revalidation should not be skipped because the inode has CIFS_CACHE_READ set.
+
+Currently cifs_dentry_needs_reval() checks CIFS_CACHE_READ before checking the
+file or directory attribute cache timeout.  This allows a read lease/oplock to
+bypass revalidation even when acregmax/acdirmax is zero.  is_inode_cache_good()
+has the same problem, since it treats CIFS_CACHE_READ as sufficient to reuse
+cached inode attributes whenever cifs_i->time is set.
+
+This can leave inode attributes such as i_blocks stale.  In particular, CIFS
+swapfile tests can observe stale allocation metadata and fail either the
+userspace swapon(8) hole check or the later cifs_swap_activate() hole check.
+
+Add a helper for disabled attribute caching and check it before trusting
+CIFS_CACHE_READ in both paths.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/inode.c | 27 ++++++++++++++++++---------
+ 1 file changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/fs/smb/client/inode.c b/fs/smb/client/inode.c
+index 4619872ffaf3..b60fd258ced0 100644
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -1164,9 +1164,21 @@ static void cifs_set_fattr_ino(int xid, struct cifs_tcon *tcon, struct super_blo
+ 	}
+ }
+ 
++static inline bool cifs_attr_cache_disabled(struct inode *inode)
++{
++	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
++
++	if (S_ISDIR(inode->i_mode))
++		return !cifs_sb->ctx->acdirmax;
++	return !cifs_sb->ctx->acregmax;
++}
++
+ static inline bool is_inode_cache_good(struct inode *ino)
+ {
+-	return ino && CIFS_CACHE_READ(CIFS_I(ino)) && CIFS_I(ino)->time != 0;
++	if (!ino || cifs_attr_cache_disabled(ino))
++		return false;
++
++	return CIFS_CACHE_READ(CIFS_I(ino)) && CIFS_I(ino)->time != 0;
+ }
+ 
+ static int reparse_info_to_fattr(struct cifs_open_info_data *data,
+@@ -2729,9 +2741,13 @@ cifs_dentry_needs_reval(struct dentry *dentry)
+ 	if (test_bit(CIFS_INO_DELETE_PENDING, &cifs_i->flags) ||
+ 	    test_bit(CIFS_INO_TMPFILE, &cifs_i->flags))
+ 		return false;
++
+ 	if (cifs_i->time == 0)
+ 		return true;
+ 
++	if (cifs_attr_cache_disabled(inode))
++		return true;
++
+ 	if (CIFS_CACHE_READ(cifs_i))
+ 		return false;
+ 
+@@ -2745,19 +2761,12 @@ cifs_dentry_needs_reval(struct dentry *dentry)
+ 		}
+ 		close_cached_dir(cfid);
+ 	}
+-	/*
+-	 * depending on inode type, check if attribute caching disabled for
+-	 * files or directories
+-	 */
++	/* depending on inode type, check if attribute caching timed out */
+ 	if (S_ISDIR(inode->i_mode)) {
+-		if (!cifs_sb->ctx->acdirmax)
+-			return true;
+ 		if (!time_in_range(jiffies, cifs_i->time,
+ 				   cifs_i->time + cifs_sb->ctx->acdirmax))
+ 			return true;
+ 	} else { /* file */
+-		if (!cifs_sb->ctx->acregmax)
+-			return true;
+ 		if (!time_in_range(jiffies, cifs_i->time,
+ 				   cifs_i->time + cifs_sb->ctx->acregmax))
+ 			return true;
+-- 
+2.43.0
+
