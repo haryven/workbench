@@ -1,0 +1,46 @@
+From 0ae65b455c323024619abb9dc0acf40a64c9f13b Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 2 Jun 2026 10:01:46 +0800
+Subject: [PATCH 4/5] smb: client: do not account EOF extension as allocation
+
+cifs_setsize() updates the local inode size after SetEOF succeeds.
+Extending EOF can create a hole and does not prove that the intervening
+range was allocated, so raising i_blocks to the new EOF can make sparse
+files appear fully allocated.
+
+Only clamp i_blocks when the file shrinks.  Leave EOF extension
+accounting to write completion or to server-reported AllocationSize from
+a later attribute query.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/inode.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/fs/smb/client/inode.c b/fs/smb/client/inode.c
+index 826d36ed13ec..3b0623eae010 100644
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -3038,13 +3038,14 @@ int cifs_fiemap(struct inode *inode, struct fiemap_extent_info *fei, u64 start,
+ 
+ void cifs_setsize(struct inode *inode, loff_t offset)
+ {
++	loff_t old_size;
++	u64 blocks = CIFS_INO_BLOCKS(offset);
++
+ 	spin_lock(&inode->i_lock);
++	old_size = i_size_read(inode);
+ 	i_size_write(inode, offset);
+-	/*
+-	 * Until we can query the server for actual allocation size,
+-	 * this is best estimate we have for blocks allocated for a file.
+-	 */
+-	inode->i_blocks = CIFS_INO_BLOCKS(offset);
++	if (offset < old_size && (u64)inode->i_blocks > blocks)
++		inode->i_blocks = blocks;
+ 	spin_unlock(&inode->i_lock);
+ 	inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+ 	truncate_pagecache(inode, offset);
+-- 
+2.43.0
+

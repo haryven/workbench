@@ -1,0 +1,36 @@
+From a849570e3c81b907acc5de6e2ce897c66948d4ec Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 2 Jun 2026 10:01:46 +0800
+Subject: [PATCH 2/5] smb: client: update compressed attribute after
+ FS_IOC_SETFLAGS
+
+FS_IOC_SETFLAGS can set the compressed flag through
+FSCTL_SET_COMPRESSION.  When that succeeds, update the cached inode
+attributes immediately.
+
+This matches smb2_set_sparse(), which updates FILE_ATTRIBUTE_SPARSE_FILE
+after a successful FSCTL_SET_SPARSE.  It also keeps the local inode
+attributes consistent with the compression change made by this client.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/ioctl.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/smb/client/ioctl.c b/fs/smb/client/ioctl.c
+index 746d70091f3d..8a755b5898bc 100644
+--- a/fs/smb/client/ioctl.c
++++ b/fs/smb/client/ioctl.c
+@@ -427,6 +427,9 @@ long cifs_ioctl(struct file *filep, unsigned int command, unsigned long arg)
+ 			if (tcon->ses->server->ops->set_compression) {
+ 				rc = tcon->ses->server->ops->set_compression(
+ 							xid, tcon, pSMBFile);
++				if (rc == 0)
++					CIFS_I(inode)->cifsAttrs |=
++						FILE_ATTRIBUTE_COMPRESSED;
+ 				cifs_dbg(FYI, "set compress flag rc %d\n", rc);
+ 			}
+ 			break;
+-- 
+2.43.0
+

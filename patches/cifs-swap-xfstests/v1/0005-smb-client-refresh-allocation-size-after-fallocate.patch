@@ -1,0 +1,63 @@
+From 436abcf455c90f8d5762b567e360209da20780d0 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 2 Jun 2026 10:01:46 +0800
+Subject: [PATCH 5/5] smb: client: refresh allocation size after fallocate
+
+SMB3 fallocate extends EOF with FILE_END_OF_FILE_INFORMATION, but the
+server may also change the allocation size.  If the client keeps the old
+local i_blocks value, swap activation can still reject a fallocated file
+even when the server has actually allocated the space.
+
+After a successful EOF-extending fallocate, query FILE_ALL_INFORMATION
+on the open handle and update i_blocks from the returned AllocationSize.
+If the query fails, leave the fallocate result unchanged and force a
+later attribute revalidation instead.
+
+This does not make servers allocate space by itself.  It makes the
+client reflect the server's reported AllocationSize after fallocate, so
+shares that really allocate the range, such as Samba with strict
+allocate enabled, can pass the swapfile hole check.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/smb2ops.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index d4875f9532b4..694c34d22e63 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -3663,9 +3663,12 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
+ 	struct inode *inode;
+ 	struct cifsInodeInfo *cifsi;
+ 	struct cifsFileInfo *cfile = file->private_data;
++	struct smb2_file_all_info file_inf;
+ 	long rc = -EOPNOTSUPP;
+ 	unsigned int xid;
+ 	loff_t new_eof;
++	u64 asize;
++	int qrc;
+ 
+ 	xid = get_xid();
+ 
+@@ -3700,6 +3703,17 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
+ 		if (rc == 0) {
+ 			netfs_resize_file(&cifsi->netfs, new_eof, true);
+ 			cifs_setsize(inode, new_eof);
++
++			qrc = SMB2_query_info(xid, tcon, cfile->fid.persistent_fid,
++					      cfile->fid.volatile_fid, &file_inf);
++			spin_lock(&inode->i_lock);
++			if (qrc == 0) {
++				asize = le64_to_cpu(file_inf.AllocationSize);
++				inode->i_blocks = CIFS_INO_BLOCKS(asize);
++			} else {
++				cifsi->time = 0;
++			}
++			spin_unlock(&inode->i_lock);
+ 		}
+ 		goto out;
+ 	}
+-- 
+2.43.0
+
