@@ -1,7 +1,7 @@
-From 0ae65b455c323024619abb9dc0acf40a64c9f13b Mon Sep 17 00:00:00 2001
+From 37c5d48a21f8197d8a979fb9cdec08de361ff1c3 Mon Sep 17 00:00:00 2001
 From: Huiwen He <hehuiwen@kylinos.cn>
 Date: Tue, 2 Jun 2026 10:01:46 +0800
-Subject: [PATCH 4/5] smb: client: do not account EOF extension as allocation
+Subject: [PATCH 2/3] smb: client: do not account EOF extension as allocation
 
 cifs_setsize() updates the local inode size after SetEOF succeeds.
 Extending EOF can create a hole and does not prove that the intervening

@@ -1,0 +1,124 @@
+From 9815854ac21e4959f2a0391b805dec42e7e6d358 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 2 Jun 2026 10:01:46 +0800
+Subject: [PATCH 1/3] smb: client: update i_blocks after contiguous writes
+
+When a lease allows CIFS to use cached inode attributes, getattr may
+return the locally cached attributes instead of revalidating them from
+the server. After local writes extend a file, the write path updates the
+file size, but i_blocks can remain based on the old allocation size.
+
+This can make a fully written file look sparse:
+
+        i_blocks * 512 < i_size
+
+and can cause swap activation to reject a valid write-created swapfile
+as having holes. This results in xfstests skipping swap-related tests
+on CIFS mounts:
+
+	generic/472         [not run] swapfiles are not supported
+	generic/494         [not run] swapfiles are not supported
+	generic/497         [not run] swapfiles are not supported
+	generic/569         [not run] swapfiles are not supported
+	generic/636         [not run] swapfiles are not supported
+	generic/643         [not run] swapfiles are not supported
+
+Update the local i_blocks estimate after successful writes, but only
+when the write starts at or before the currently known allocated range.
+This lets sequential writes grow i_blocks while avoiding treating
+write-past-EOF holes as allocated.
+
+Skip the local estimate for files that are already marked sparse, since
+their allocation needs to come from the server rather than from a
+contiguous-write estimate.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/cifsglob.h |  9 ++++++---
+ fs/smb/client/file.c     | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index 82e0adc1dabd..0c817413aeea 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -2387,9 +2387,12 @@ static inline int cifs_open_create_options(unsigned int oflags, int opts)
+ }
+ 
+ /*
+- * The number of blocks is not related to (i_size / i_blksize), but instead
+- * 512 byte (2**9) size is required for calculating num blocks.
++ * inode->i_blocks is counted in 512-byte sectors, independent of
++ * inode->i_blksize.
+  */
+-#define CIFS_INO_BLOCKS(size) DIV_ROUND_UP_ULL((u64)(size), 512)
++#define CIFS_INO_BLOCK_SIZE 512ULL
++#define CIFS_INO_BLOCKS(size) \
++	DIV_ROUND_UP_ULL((u64)(size), CIFS_INO_BLOCK_SIZE)
++#define CIFS_INO_BYTES(blocks) ((u64)(blocks) * CIFS_INO_BLOCK_SIZE)
+ 
+ #endif	/* _CIFS_GLOB_H */
+diff --git a/fs/smb/client/file.c b/fs/smb/client/file.c
+index b60344125f27..472b960b9bb7 100644
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -2514,6 +2514,25 @@ int cifs_lock(struct file *file, int cmd, struct file_lock *flock)
+ 	return rc;
+ }
+ 
++static void cifs_update_i_blocks_after_write(struct inode *inode, loff_t start,
++					     loff_t end)
++{
++	struct cifsInodeInfo *cinode = CIFS_I(inode);
++	u64 allocated_end = CIFS_INO_BYTES(inode->i_blocks);
++	u64 blocks;
++
++	if (cinode->cifsAttrs & FILE_ATTRIBUTE_SPARSE_FILE)
++		return;
++
++	/* Only extend the local estimate across a contiguous allocated prefix. */
++	if ((u64)start > allocated_end)
++		return;
++
++	blocks = CIFS_INO_BLOCKS(end);
++	if ((u64)inode->i_blocks < blocks)
++		inode->i_blocks = blocks;
++}
++
+ void cifs_write_subrequest_terminated(struct cifs_io_subrequest *wdata, ssize_t result)
+ {
+ 	struct netfs_io_request *wreq = wdata->rreq;
+@@ -2532,6 +2551,8 @@ void cifs_write_subrequest_terminated(struct cifs_io_subrequest *wdata, ssize_t
+ 			netfs_write_zero_point(inode, wrend);
+ 		if (wrend > ictx->_remote_i_size)
+ 			netfs_resize_file(ictx, wrend, true);
++		cifs_update_i_blocks_after_write(inode, wdata->subreq.start,
++						 wrend);
+ 
+ 		spin_unlock(&inode->i_lock);
+ 	}
+@@ -2895,6 +2916,7 @@ cifs_writev(struct kiocb *iocb, struct iov_iter *from)
+ 	struct cifsInodeInfo *cinode = CIFS_I(inode);
+ 	struct TCP_Server_Info *server = tlink_tcon(cfile->tlink)->ses->server;
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
++	loff_t start;
+ 	ssize_t rc;
+ 
+ 	rc = netfs_start_io_write(inode);
+@@ -2919,7 +2941,13 @@ cifs_writev(struct kiocb *iocb, struct iov_iter *from)
+ 		goto out;
+ 	}
+ 
++	start = iocb->ki_pos;
+ 	rc = netfs_buffered_write_iter_locked(iocb, from, NULL);
++	if (rc > 0) {
++		spin_lock(&inode->i_lock);
++		cifs_update_i_blocks_after_write(inode, start, start + rc);
++		spin_unlock(&inode->i_lock);
++	}
+ 
+ out:
+ 	up_read(&cinode->lock_sem);
+-- 
+2.43.0
+
