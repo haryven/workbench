@@ -1,0 +1,112 @@
+From f0141f389a405b75b60e861f86f7acbc862b8f8d Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 4 Jun 2026 00:46:39 +0800
+Subject: [PATCH] smbd: fix chmod failed
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ source3/smbd/posix_acls.c | 73 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 5 deletions(-)
+
+diff --git a/source3/smbd/posix_acls.c b/source3/smbd/posix_acls.c
+index 00ec9960023..92a984eed8f 100644
+--- a/source3/smbd/posix_acls.c
++++ b/source3/smbd/posix_acls.c
+@@ -1165,6 +1165,57 @@ static NTSTATUS unpack_nt_owners(struct connection_struct *conn,
+ }
+ 
+ 
++static bool security_descriptor_has_only_ms_nfs(
++	const struct security_descriptor *psd)
++{
++	uint32_t i;
++
++	if (psd->dacl == NULL || psd->dacl->num_aces == 0) {
++		return false;
++	}
++
++	for (i = 0; i < psd->dacl->num_aces; i++) {
++		if (dom_sid_compare_domain(&global_sid_Unix_NFS,
++					   &psd->dacl->aces[i].trustee) != 0) {
++			return false;
++		}
++	}
++
++	return true;
++}
++
++static bool security_descriptor_get_ms_nfs_mode(
++	const struct security_descriptor *psd,
++	mode_t *pmode)
++{
++	uint32_t i;
++
++	if (psd->dacl == NULL) {
++		return false;
++	}
++
++	for (i = 0; i < psd->dacl->num_aces; i++) {
++		const struct security_ace *ace = &psd->dacl->aces[i];
++		int cmp;
++
++		if (ace->trustee.num_auths != 3) {
++			continue;
++		}
++
++		cmp = dom_sid_compare_domain(&global_sid_Unix_NFS_Mode,
++					     &ace->trustee);
++		if (cmp != 0) {
++			continue;
++		}
++
++		*pmode = (mode_t)ace->trustee.sub_auths[2];
++		*pmode &= 07777;
++		return true;
++	}
++
++	return false;
++}
++
+ static void trim_ace_perms(canon_ace *pace)
+ {
+ 	pace->perms = pace->perms & (S_IXUSR|S_IWUSR|S_IRUSR);
+@@ -3575,6 +3626,7 @@ NTSTATUS set_nt_acl(files_struct *fsp, uint32_t security_info_sent, const struct
+ 	canon_ace *dir_ace_list = NULL;
+ 	bool acl_perms = False;
+ 	mode_t orig_mode = (mode_t)0;
++	mode_t ms_nfs_mode = (mode_t)0;
+ 	NTSTATUS status;
+ 	bool set_acl_as_root = false;
+ 	bool acl_set_support = false;
+@@ -3594,12 +3646,23 @@ NTSTATUS set_nt_acl(files_struct *fsp, uint32_t security_info_sent, const struct
+ 	}
+ 
+ 	/*
+-	 * MS NFS mode, here's the deal: the client merely wants to
+-	 * modify the mode, but roundtripping get_acl/set/acl would
+-	 * add additional POSIX ACEs.  So in case we get a request
+-	 * containing a MS NFS mode SID, we do nothing here.
++	 * MS-NFS mode SIDs are virtual POSIX metadata. A DACL made only
++	 * of MS-NFS ACEs is not a real POSIX ACL update, so keep the
++	 * historic no-op behavior for that case. Linux cifs.ko with
++	 * modefromsid sends the requested mode as S-1-5-88-3-<mode> in a
++	 * mixed DACL; apply that mode here instead of feeding the special
++	 * SID into the normal SID-to-uid/gid ACL conversion path.
+ 	 */
+-	if (security_descriptor_with_ms_nfs(psd_orig)) {
++	if (security_descriptor_has_only_ms_nfs(psd_orig)) {
++		return NT_STATUS_OK;
++	}
++	if (security_descriptor_get_ms_nfs_mode(psd_orig, &ms_nfs_mode)) {
++		int sret;
++
++		sret = SMB_VFS_FCHMOD(fsp, ms_nfs_mode);
++		if (sret == -1) {
++			return map_nt_error_from_unix(errno);
++		}
+ 		return NT_STATUS_OK;
+ 	}
+ 
+-- 
+2.43.0
+
