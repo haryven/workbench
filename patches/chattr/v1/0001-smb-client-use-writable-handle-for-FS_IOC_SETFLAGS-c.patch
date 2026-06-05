@@ -1,0 +1,158 @@
+From 6b77a62777ec0f4f30b93c12878c4ed4faff092d Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 2 Jun 2026 15:49:05 +0800
+Subject: [PATCH 1/2] smb/client: use writable handle for FS_IOC_SETFLAGS
+ compression
+
+Setting the compressed flag on a CIFS mount can fail with -EACCES:
+
+        $ touch test.bin
+        $ chattr +c test.bin
+        chattr: Permission denied while setting flags on test.bin
+
+This can be reproduced against a Samba share backed by a filesystem that
+supports compression, such as btrfs.
+
+FS_IOC_SETFLAGS is issued on the file handle opened by userspace.  chattr
+opens the target read-only before setting FS_COMPR_FL, so the SMB client
+currently sends FSCTL_SET_COMPRESSION on a handle that may not have
+FILE_WRITE_DATA access.  Samba requires FILE_WRITE_DATA for
+FSCTL_SET_COMPRESSION and rejects the request.
+
+Use the current handle only if it already has FILE_WRITE_DATA.  Otherwise
+try an existing writable handle for the inode.  If none is available, open
+a temporary FILE_WRITE_DATA handle for the compression request.
+
+After FSCTL_SET_COMPRESSION succeeds, update the cached compressed
+attribute immediately, matching how smb2_set_sparse() updates
+FILE_ATTRIBUTE_SPARSE_FILE after a successful FSCTL_SET_SPARSE.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+---
+ fs/smb/client/ioctl.c | 102 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 100 insertions(+), 2 deletions(-)
+
+diff --git a/fs/smb/client/ioctl.c b/fs/smb/client/ioctl.c
+index 17408bb8ab65..b5645e6402a5 100644
+--- a/fs/smb/client/ioctl.c
++++ b/fs/smb/client/ioctl.c
+@@ -67,6 +67,98 @@ static long cifs_ioctl_query_info(unsigned int xid, struct file *filep,
+ 	return rc;
+ }
+ 
++static int cifs_ioctl_set_compression(unsigned int xid, struct file *filep,
++				      struct cifs_tcon *tcon,
++				      struct cifsFileInfo *cfile)
++{
++	struct inode *inode = file_inode(filep);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++	struct TCP_Server_Info *server = tcon->ses->server;
++	struct cifs_open_parms oparms;
++	struct cifs_open_info_data data = {};
++	struct cifsFileInfo *wfile;
++	struct cifsFileInfo tmp_cfile = {};
++	struct cifs_tcon *wtcon;
++	struct cifs_fid fid = {};
++	const char *full_path;
++	u64 uniqueid;
++	__u32 oplock = 0;
++	void *page;
++	int rc;
++
++	if (!server->ops->set_compression)
++		return -EOPNOTSUPP;
++
++	if (cfile && (cfile->fid.access & FILE_WRITE_DATA)) {
++		rc = server->ops->set_compression(xid, tcon, cfile);
++		if (rc != -EACCES)
++			return rc;
++	}
++
++	rc = cifs_get_writable_file(CIFS_I(inode), FIND_FSUID_ONLY, &wfile);
++	if (!rc) {
++		wtcon = tlink_tcon(wfile->tlink);
++		if (wtcon->ses->server->ops->set_compression)
++			rc = wtcon->ses->server->ops->set_compression(xid,
++									  wtcon, wfile);
++		else
++			rc = -EOPNOTSUPP;
++		cifsFileInfo_put(wfile);
++		if (rc != -EACCES)
++			return rc;
++	}
++
++	if (!server->ops->open || !server->ops->close)
++		return -EOPNOTSUPP;
++
++	if (!(cifs_sb_flags(cifs_sb) & CIFS_MOUNT_SERVER_INUM) ||
++	    cifs_sb->mnt_cifs_serverino_autodisabled)
++		return -EOPNOTSUPP;
++
++	if (d_unhashed(filep->f_path.dentry))
++		return -ESTALE;
++
++	page = alloc_dentry_path();
++	full_path = build_path_from_dentry(filep->f_path.dentry, page);
++	if (IS_ERR(full_path)) {
++		free_dentry_path(page);
++		return PTR_ERR(full_path);
++	}
++
++	oparms = CIFS_OPARMS(cifs_sb, tcon, full_path, FILE_WRITE_DATA,
++			     FILE_OPEN, 0, ACL_NO_MODE);
++	oparms.fid = &fid;
++
++	rc = server->ops->open(xid, &oparms, &oplock, NULL);
++	if (rc)
++		goto out;
++
++	tmp_cfile.fid = fid;
++	if (!server->ops->query_file_info) {
++		rc = -EOPNOTSUPP;
++		goto close;
++	}
++
++	rc = server->ops->query_file_info(xid, tcon, &tmp_cfile, &data);
++	if (rc)
++		goto close;
++
++	uniqueid = le64_to_cpu(data.fi.IndexNumber);
++	if (uniqueid != CIFS_I(inode)->uniqueid) {
++		rc = -ESTALE;
++		goto close;
++	}
++
++	rc = server->ops->set_compression(xid, tcon, &tmp_cfile);
++
++close:
++	server->ops->close(xid, tcon, &fid);
++	cifs_free_open_info(&data);
++out:
++	free_dentry_path(page);
++	return rc;
++}
++
+ static long cifs_ioctl_copychunk(unsigned int xid, struct file *dst_file,
+ 			unsigned long srcfd)
+ {
+@@ -427,8 +519,14 @@ long cifs_ioctl(struct file *filep, unsigned int command, unsigned long arg)
+ 
+ 			/* Try to set compress flag */
+ 			if (tcon->ses->server->ops->set_compression) {
+-				rc = tcon->ses->server->ops->set_compression(
+-							xid, tcon, pSMBFile);
++				rc = cifs_ioctl_set_compression(xid, filep, tcon,
++								pSMBFile);
++				if (rc == 0) {
++					spin_lock(&inode->i_lock);
++					CIFS_I(inode)->cifsAttrs |=
++						FILE_ATTRIBUTE_COMPRESSED;
++					spin_unlock(&inode->i_lock);
++				}
+ 				cifs_dbg(FYI, "set compress flag rc %d\n", rc);
+ 			}
+ 			break;
+-- 
+2.43.0
+

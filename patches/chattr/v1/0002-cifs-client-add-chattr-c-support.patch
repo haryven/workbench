@@ -1,0 +1,215 @@
+From 8c6a8253c8b76e16b0a28b812038621f7b45dcfe Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Fri, 5 Jun 2026 11:15:07 +0800
+Subject: [PATCH 2/2] cifs/client: add chattr -c support
+
+---
+ fs/smb/client/cifsglob.h  |  2 +-
+ fs/smb/client/cifssmb.c   |  4 ++--
+ fs/smb/client/ioctl.c     | 35 +++++++++++++++++++++++------------
+ fs/smb/client/smb1ops.c   |  5 +++--
+ fs/smb/client/smb1proto.h |  2 +-
+ fs/smb/client/smb2ops.c   |  4 ++--
+ fs/smb/client/smb2pdu.c   |  6 +++---
+ fs/smb/client/smb2proto.h |  3 ++-
+ 8 files changed, 37 insertions(+), 24 deletions(-)
+
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index 943b7cd2c096..a462c1590a9e 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -425,7 +425,7 @@ struct smb_version_operations {
+ 	int (*set_file_info)(struct inode *, const char *, FILE_BASIC_INFO *,
+ 			     const unsigned int);
+ 	int (*set_compression)(const unsigned int, struct cifs_tcon *,
+-			       struct cifsFileInfo *);
++			       struct cifsFileInfo *, __u16);
+ 	/* check if we can send an echo or nor */
+ 	bool (*can_echo)(struct TCP_Server_Info *);
+ 	/* send echo request */
+diff --git a/fs/smb/client/cifssmb.c b/fs/smb/client/cifssmb.c
+index 9e27bfa7376b..d39175cdf1b1 100644
+--- a/fs/smb/client/cifssmb.c
++++ b/fs/smb/client/cifssmb.c
+@@ -3207,7 +3207,7 @@ struct inode *cifs_create_reparse_inode(struct cifs_open_info_data *data,
+ 
+ int
+ CIFSSMB_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
+-		    __u16 fid)
++		    __u16 fid, __u16 compression_state)
+ {
+ 	int rc = 0;
+ 	int bytes_returned;
+@@ -3222,7 +3222,7 @@ CIFSSMB_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
+ 		return rc;
+ 	in_len = rc;
+ 
+-	pSMB->compression_state = cpu_to_le16(COMPRESSION_FORMAT_DEFAULT);
++	pSMB->compression_state = cpu_to_le16(compression_state);
+ 
+ 	pSMB->TotalParameterCount = 0;
+ 	pSMB->TotalDataCount = cpu_to_le32(2);
+diff --git a/fs/smb/client/ioctl.c b/fs/smb/client/ioctl.c
+index b5645e6402a5..588320c96943 100644
+--- a/fs/smb/client/ioctl.c
++++ b/fs/smb/client/ioctl.c
+@@ -69,7 +69,8 @@ static long cifs_ioctl_query_info(unsigned int xid, struct file *filep,
+ 
+ static int cifs_ioctl_set_compression(unsigned int xid, struct file *filep,
+ 				      struct cifs_tcon *tcon,
+-				      struct cifsFileInfo *cfile)
++				      struct cifsFileInfo *cfile,
++				      __u16 compression_state)
+ {
+ 	struct inode *inode = file_inode(filep);
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+@@ -90,7 +91,8 @@ static int cifs_ioctl_set_compression(unsigned int xid, struct file *filep,
+ 		return -EOPNOTSUPP;
+ 
+ 	if (cfile && (cfile->fid.access & FILE_WRITE_DATA)) {
+-		rc = server->ops->set_compression(xid, tcon, cfile);
++		rc = server->ops->set_compression(xid, tcon, cfile,
++						 compression_state);
+ 		if (rc != -EACCES)
+ 			return rc;
+ 	}
+@@ -100,7 +102,8 @@ static int cifs_ioctl_set_compression(unsigned int xid, struct file *filep,
+ 		wtcon = tlink_tcon(wfile->tlink);
+ 		if (wtcon->ses->server->ops->set_compression)
+ 			rc = wtcon->ses->server->ops->set_compression(xid,
+-									  wtcon, wfile);
++									  wtcon, wfile,
++									  compression_state);
+ 		else
+ 			rc = -EOPNOTSUPP;
+ 		cifsFileInfo_put(wfile);
+@@ -149,7 +152,8 @@ static int cifs_ioctl_set_compression(unsigned int xid, struct file *filep,
+ 		goto close;
+ 	}
+ 
+-	rc = server->ops->set_compression(xid, tcon, &tmp_cfile);
++	rc = server->ops->set_compression(xid, tcon, &tmp_cfile,
++						 compression_state);
+ 
+ close:
+ 	server->ops->close(xid, tcon, &fid);
+@@ -513,18 +517,25 @@ long cifs_ioctl(struct file *filep, unsigned int command, unsigned long arg)
+ 			 *	break;
+ 			 */
+ 
+-			/* Currently only flag we can set is compressed flag */
+-			if ((ExtAttrBits & FS_COMPR_FL) == 0)
+-				break;
+-
+-			/* Try to set compress flag */
++			/* Currently only flag we can set or clear is compressed. */
+ 			if (tcon->ses->server->ops->set_compression) {
++				__u16 compression_state;
++
++				compression_state = (ExtAttrBits & FS_COMPR_FL) ?
++					COMPRESSION_FORMAT_DEFAULT :
++					COMPRESSION_FORMAT_NONE;
++
+ 				rc = cifs_ioctl_set_compression(xid, filep, tcon,
+-								pSMBFile);
++								pSMBFile,
++								compression_state);
+ 				if (rc == 0) {
+ 					spin_lock(&inode->i_lock);
+-					CIFS_I(inode)->cifsAttrs |=
+-						FILE_ATTRIBUTE_COMPRESSED;
++					if (ExtAttrBits & FS_COMPR_FL)
++						CIFS_I(inode)->cifsAttrs |=
++							FILE_ATTRIBUTE_COMPRESSED;
++					else
++						CIFS_I(inode)->cifsAttrs &=
++							~FILE_ATTRIBUTE_COMPRESSED;
+ 					spin_unlock(&inode->i_lock);
+ 				}
+ 				cifs_dbg(FYI, "set compress flag rc %d\n", rc);
+diff --git a/fs/smb/client/smb1ops.c b/fs/smb/client/smb1ops.c
+index e198e3dda917..d34b3d99f6ed 100644
+--- a/fs/smb/client/smb1ops.c
++++ b/fs/smb/client/smb1ops.c
+@@ -1110,9 +1110,10 @@ smb_set_file_info(struct inode *inode, const char *full_path,
+ 
+ static int
+ cifs_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
+-		   struct cifsFileInfo *cfile)
++		   struct cifsFileInfo *cfile, __u16 compression_state)
+ {
+-	return CIFSSMB_set_compression(xid, tcon, cfile->fid.netfid);
++	return CIFSSMB_set_compression(xid, tcon, cfile->fid.netfid,
++				       compression_state);
+ }
+ 
+ static int
+diff --git a/fs/smb/client/smb1proto.h b/fs/smb/client/smb1proto.h
+index 5f522d359952..80eaeb3dd2ec 100644
+--- a/fs/smb/client/smb1proto.h
++++ b/fs/smb/client/smb1proto.h
+@@ -117,7 +117,7 @@ struct inode *cifs_create_reparse_inode(struct cifs_open_info_data *data,
+ 					struct kvec *reparse_iov,
+ 					struct kvec *xattr_iov);
+ int CIFSSMB_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
+-			    __u16 fid);
++			    __u16 fid, __u16 compression_state);
+ int cifs_do_get_acl(const unsigned int xid, struct cifs_tcon *tcon,
+ 		    const unsigned char *searchName, struct posix_acl **acl,
+ 		    const int acl_type, const struct nls_table *nls_codepage,
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index 89230141b5dd..23807023c027 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -2246,10 +2246,10 @@ smb2_duplicate_extents(const unsigned int xid,
+ 
+ static int
+ smb2_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
+-		   struct cifsFileInfo *cfile)
++		   struct cifsFileInfo *cfile, __u16 compression_state)
+ {
+ 	return SMB2_set_compression(xid, tcon, cfile->fid.persistent_fid,
+-			    cfile->fid.volatile_fid);
++			    cfile->fid.volatile_fid, compression_state);
+ }
+ 
+ static int
+diff --git a/fs/smb/client/smb2pdu.c b/fs/smb/client/smb2pdu.c
+index fbeb2156ddb6..6a185b805c1e 100644
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -3626,14 +3626,14 @@ SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
+ 
+ int
+ SMB2_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
+-		     u64 persistent_fid, u64 volatile_fid)
++		     u64 persistent_fid, u64 volatile_fid,
++		     __u16 compression_state)
+ {
+ 	int rc;
+ 	struct  compress_ioctl fsctl_input;
+ 	char *ret_data = NULL;
+ 
+-	fsctl_input.CompressionState =
+-			cpu_to_le16(COMPRESSION_FORMAT_DEFAULT);
++	fsctl_input.CompressionState = cpu_to_le16(compression_state);
+ 
+ 	rc = SMB2_ioctl(xid, tcon, persistent_fid, volatile_fid,
+ 			FSCTL_SET_COMPRESSION,
+diff --git a/fs/smb/client/smb2proto.h b/fs/smb/client/smb2proto.h
+index 1ceb95b907e6..78a4e1c340f9 100644
+--- a/fs/smb/client/smb2proto.h
++++ b/fs/smb/client/smb2proto.h
+@@ -216,7 +216,8 @@ int SMB2_set_ea(const unsigned int xid, struct cifs_tcon *tcon,
+ 		u64 persistent_fid, u64 volatile_fid,
+ 		struct smb2_file_full_ea_info *buf, int len);
+ int SMB2_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
+-			 u64 persistent_fid, u64 volatile_fid);
++			 u64 persistent_fid, u64 volatile_fid,
++			 __u16 compression_state);
+ int SMB2_oplock_break(const unsigned int xid, struct cifs_tcon *tcon,
+ 		      const u64 persistent_fid, const u64 volatile_fid,
+ 		      __u8 oplock_level);
+-- 
+2.43.0
+
