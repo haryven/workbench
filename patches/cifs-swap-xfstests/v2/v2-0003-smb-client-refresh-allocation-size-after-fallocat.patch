@@ -1,7 +1,7 @@
-From 30e582befd0b9fab3e4d0ceb25aeee850e5829c0 Mon Sep 17 00:00:00 2001
+From 634b95a66b03095abcb76cb47d0a85e3f13b1063 Mon Sep 17 00:00:00 2001
 From: Huiwen He <hehuiwen@kylinos.cn>
 Date: Tue, 2 Jun 2026 10:01:46 +0800
-Subject: [PATCH 3/3] smb/client: refresh allocation size after fallocate
+Subject: [PATCH v2 3/3] smb/client: refresh allocation size after fallocate
 
 SMB3 fallocate extends EOF using FILE_END_OF_FILE_INFORMATION, but the
 server may also update the file's AllocationSize.  If the client keeps

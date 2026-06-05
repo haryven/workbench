@@ -1,0 +1,66 @@
+From 634b95a66b03095abcb76cb47d0a85e3f13b1063 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Sat, 6 Jun 2026 00:11:54 +0800
+Subject: [PATCH v2 0/3] smb: client: fix i_blocks accounting for swapfile xfstests
+
+This series fixes CIFS swapfile xfstests failures caused by incorrect local
+i_blocks accounting while cached inode attributes can be used.
+
+The patches cover three cases:
+
+  1. Update i_blocks after contiguous writes, so fully written swapfiles do
+     not look sparse.
+
+  2. Do not grow i_blocks on EOF extension, since extending EOF does not
+     prove that the range was allocated.
+
+  3. After EOF-extending fallocate, refresh i_blocks from the
+     server-reported AllocationSize.
+
+In my setup, the write-created swapfile tests pass with the cifsacl mount
+option:
+
+        generic/472 generic/494 generic/497
+        generic/569 generic/636 generic/643
+
+generic/496 also passes with this series when the server really allocates the
+fallocated range, for example with Samba:
+
+        [scratch_share]
+        strict allocate = yes
+
+generic/495 depends on the server-reported allocation unit matching the page
+size.  In my Samba setup this requires:
+
+        [global]
+        block size = 4096
+
+---
+Changes since v1:
+- Patch 1 was updated to cover more CIFS write paths and to use common
+  helpers for local i_blocks accounting.
+- Patches 2 and 3 are unchanged.
+
+Link to v1:
+https://lore.kernel.org/linux-cifs/20260604150349.101716-1-huiwen.he@linux.dev/
+---
+
+Thanks,
+Huiwen He
+
+Huiwen He (3):
+  smb/client: update i_blocks after contiguous writes
+  smb/client: do not account EOF extension as allocation
+  smb/client: refresh allocation size after fallocate
+
+ fs/smb/client/cifsfs.c   |  4 ++--
+ fs/smb/client/cifsfs.h   |  1 +
+ fs/smb/client/cifsglob.h |  9 ++++---
+ fs/smb/client/file.c     | 52 ++++++++++++++++++++++++++++++++++++++++
+ fs/smb/client/inode.c    | 13 +++++++---
+ fs/smb/client/smb2ops.c  | 15 ++++++++++++
+ 6 files changed, 86 insertions(+), 8 deletions(-)
+
+-- 
+2.43.0
+
