@@ -1,0 +1,43 @@
+From 0dbb7941636ddf5de4328bb287a328a8928f6c62 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Sat, 6 Jun 2026 18:12:48 +0800
+Subject: [PATCH v1 0/3] smb: client: fix file compression flag ioctls
+
+This series fixes three CIFS compression flag ioctl issues.
+
+Patch 1 fixes lsattr showing random flags when the file does not
+have the compressed attribute set.
+
+Patch 2 fixes chattr +c failures caused by sending
+FSCTL_SET_COMPRESSION on a handle without FILE_WRITE_DATA access.
+
+Patch 3 fixes chattr -c failures by sending
+COMPRESSION_FORMAT_NONE when FS_COMPR_FL is cleared.
+
+Thanks,
+Huiwen He
+
+---
+Link before v1:
+patch 1: https://lore.kernel.org/linux-cifs/20260602105930.713403-1-huiwen.he@linux.dev
+patch 2: https://lore.kernel.org/linux-cifs/20260604151859.102653-1-huiwen.he@linux.dev
+patch 3: https://lore.kernel.org/linux-cifs/20260605170055.172146-1-huiwen.he@linux.dev
+---
+Huiwen He (3):
+  smb/client: always return a value for FS_IOC_GETFLAGS
+  smb/client: use writable handle for FS_IOC_SETFLAGS compression
+  smb/client: allow FS_IOC_SETFLAGS to clear compression
+
+ fs/smb/client/cifsglob.h  |   2 +-
+ fs/smb/client/cifssmb.c   |   4 +-
+ fs/smb/client/ioctl.c     | 151 +++++++++++++++++++++++++++++++++++---
+ fs/smb/client/smb1ops.c   |   5 +-
+ fs/smb/client/smb1proto.h |   2 +-
+ fs/smb/client/smb2ops.c   |   4 +-
+ fs/smb/client/smb2pdu.c   |   6 +-
+ fs/smb/client/smb2proto.h |   3 +-
+ 8 files changed, 153 insertions(+), 24 deletions(-)
+
+-- 
+2.43.0
+
