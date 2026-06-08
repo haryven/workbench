@@ -1,0 +1,39 @@
+From 44ff0712fce4ead2f1054b4e1b4bc261202d6455 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 8 Jun 2026 23:29:43 +0800
+Subject: [PATCH v2 0/3] smb: client: fix file compression flag ioctls
+
+v1->v2:
+- Patch 1 is unchanged.
+- Patch 2 now requests FILE_READ_ATTRIBUTES for the temporary by-path
+  handle, only falls back to by-path open for -EBADF from
+  cifs_get_writable_file(), removes the thin set_compression wrapper, and
+  moves the temporary cifsFileInfo off the stack to fix the LKP
+  frame-size warning.
+- Patch 3 now returns -EOPNOTSUPP for unsupported FS_IOC_SETFLAGS bits and
+  is adjusted for the helper cleanup in patch 2.
+
+Link to v1:
+https://lore.kernel.org/linux-cifs/20260606144316.183032-1-huiwen.he@linux.dev
+
+Thanks,
+Huiwen He
+
+Huiwen He (3):
+  smb/client: always return a value for FS_IOC_GETFLAGS
+  smb/client: use writable handle for FS_IOC_SETFLAGS compression
+  smb/client: allow FS_IOC_SETFLAGS to clear compression
+
+ fs/smb/client/cifsglob.h  |   2 +-
+ fs/smb/client/cifssmb.c   |   4 +-
+ fs/smb/client/ioctl.c     | 153 ++++++++++++++++++++++++++++++++++----
+ fs/smb/client/smb1ops.c   |   5 +-
+ fs/smb/client/smb1proto.h |   2 +-
+ fs/smb/client/smb2ops.c   |   4 +-
+ fs/smb/client/smb2pdu.c   |   6 +-
+ fs/smb/client/smb2proto.h |   3 +-
+ 8 files changed, 153 insertions(+), 26 deletions(-)
+
+-- 
+2.43.0
+
