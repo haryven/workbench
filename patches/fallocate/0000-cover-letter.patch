@@ -1,0 +1,36 @@
+From e48c69dc554418f9025cf5876ae76710c0dd922a Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 22 Jun 2026 22:03:21 +0800
+Subject: [PATCH v1 0/6] smb/client: fix mode 0 fallocate handling
+
+CIFS mode 0 fallocate can return success without allocating the requested
+space. It can also incorrectly derive i_blocks from EOF, making sparse
+files appear fully allocated.
+
+This series propagates sparse conversion failures, corrects i_blocks
+accounting, and verifies server allocation after EOF-extending fallocate.
+It also improves the existing zero-write emulation and supports small
+ranges starting at EOF.
+
+Arbitrary range allocation remains unsupported because SMB2 provides no
+equivalent operation.
+
+Huiwen He (6):
+  smb/client: handle smb2_set_sparse() failure in EOF-extending
+    fallocate
+  smb/client: handle smb2_set_sparse() failure in range fallocate
+  smb/client: do not account EOF extension as allocation
+  smb/client: verify allocation after EOF-extending fallocate
+  smb/client: reduce fallocate zero buffer allocation
+  smb/client: emulate small fallocate ranges at EOF
+
+ fs/smb/client/inode.c     |  13 +++-
+ fs/smb/client/smb2ops.c   | 126 ++++++++++++++++++++++++++++++++++----
+ fs/smb/client/smb2pdu.c   |  19 ++++++
+ fs/smb/client/smb2proto.h |   3 +
+ fs/smb/common/fscc.h      |   5 ++
+ 5 files changed, 150 insertions(+), 16 deletions(-)
+
+-- 
+2.43.0
+

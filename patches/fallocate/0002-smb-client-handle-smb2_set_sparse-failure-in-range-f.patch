@@ -1,0 +1,44 @@
+From 72c529ac35e6cb0fbe177cd0548bbffd4ef54299 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 22 Jun 2026 17:44:26 +0800
+Subject: [PATCH v1 2/6] smb/client: handle smb2_set_sparse() failure in range
+ fallocate
+
+A range fallocate(mode=0) on a sparse file can return success while the
+requested range still contains holes. Later writes into that range may
+still fail because the sparse file conversion never succeeded.
+
+CIFS emulates this operation by clearing the sparse attribute for the
+whole file. However, it ignores failure from smb2_set_sparse() and sets
+the return value to zero unconditionally.
+
+Return -EOPNOTSUPP when the sparse attribute cannot be cleared. This
+prevents CIFS from reporting successful preallocation when the server
+rejected FSCTL_SET_SPARSE.
+
+Fixes: f16994797ea8 ("cifs: fix incorrect handling of smb2_set_sparse() return in smb3_simple_falloc")
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/smb2ops.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index 68689f1414d3..6f5c5e2a9b1f 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -3770,8 +3770,10 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
+ 		}
+ 	}
+ 
+-	smb2_set_sparse(xid, tcon, cfile, inode, false);
+-	rc = 0;
++	if (!smb2_set_sparse(xid, tcon, cfile, inode, false))
++		rc = -EOPNOTSUPP;
++	else
++		rc = 0;
+ 
+ out:
+ 	if (rc)
+-- 
+2.43.0
+

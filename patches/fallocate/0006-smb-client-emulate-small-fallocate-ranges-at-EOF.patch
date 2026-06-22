@@ -1,0 +1,80 @@
+From e48c69dc554418f9025cf5876ae76710c0dd922a Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 15 Jun 2026 23:30:27 +0800
+Subject: [PATCH v1 6/6] smb/client: emulate small fallocate ranges at EOF
+
+smb3_simple_falloc() now returns -EOPNOTSUPP for mode 0 requests that
+start at EOF of a non-empty file because FILE_ALLOCATION_INFORMATION
+cannot allocate an arbitrary byte range.
+
+However, one small case can be handled safely: a range that starts exactly
+at the current EOF. For example:
+
+        xfs_io -f -c "pwrite 0 1m" file
+        xfs_io -c "falloc 1m 4k" file
+
+This does not create an intervening hole or overwrite existing data. Write
+zeroes to the requested range so that it is allocated and EOF is extended
+by the write. Limit this zero-write emulation to 1 MiB to keep the cost
+bounded.
+
+This allows small EOF-adjacent fallocate requests to succeed. After the
+write, update the local file size and refresh i_blocks from the
+server-reported AllocationSize. Larger ranges remain unsupported.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/smb2ops.c | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index 0974ea681c6d..2f8c7db3c490 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -3696,6 +3696,43 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
+ 		if (rc)
+ 			goto out;
+ 
++		/*
++		 * A small range immediately after EOF can be allocated by
++		 * writing zeroes without creating an intervening hole.
++		 */
++		if (off == old_eof && old_eof != 0) {
++			if (len > 1024 * 1024) {
++				rc = -EOPNOTSUPP;
++				goto out;
++			}
++
++			rc = smb3_simple_fallocate_range(xid, tcon, cfile,
++							 off, len);
++			if (rc) {
++				spin_lock(&inode->i_lock);
++				cifsi->time = 0;
++				spin_unlock(&inode->i_lock);
++				goto out;
++			}
++
++			new_eof = off + len;
++			netfs_resize_file(&cifsi->netfs, new_eof, true);
++			cifs_setsize(inode, new_eof);
++
++			qrc = SMB2_query_info(xid, tcon,
++					      cfile->fid.persistent_fid,
++					      cfile->fid.volatile_fid, &file_inf);
++			spin_lock(&inode->i_lock);
++			if (qrc == 0) {
++				asize = le64_to_cpu(file_inf.AllocationSize);
++				inode->i_blocks = CIFS_INO_BLOCKS(asize);
++			} else {
++				cifsi->time = 0;
++			}
++			spin_unlock(&inode->i_lock);
++			goto out;
++		}
++
+ 		/*
+ 		 * FILE_ALLOCATION_INFORMATION sets the file allocation size. It
+ 		 * cannot allocate an arbitrary byte range. Use it only when
+-- 
+2.43.0
+
