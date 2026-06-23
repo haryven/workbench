@@ -1,0 +1,41 @@
+From 5da65871daac826e15ab461b1211adfcc53560a1 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 23 Jun 2026 23:44:47 +0800
+Subject: [PATCH v2 0/9] smb/client: fix mode 0 fallocate handling
+
+Changes since v1:
+- Add patch 2 to preserve FSCTL_SET_SPARSE errors and only cache
+  EOPNOTSUPP as missing sparse support.
+- Update patch 6 to allow verified EOF-adjacent fallocate on non-sparse
+  files.
+- Add patch 7 to handle allocated ranges that overlap the requested
+  fallocate range.
+- Update patch 9 to limit zero-write emulation to small EOF-adjacent
+  ranges on sparse files.
+
+Link to v1:
+https://lore.kernel.org/linux-cifs/20260623024619.1360127-1-huiwen.he@linux.dev
+
+Huiwen He (9):
+  smb/client: name the default fallocate mode
+  smb/client: preserve errors from smb2_set_sparse()
+  smb/client: handle smb2_set_sparse() failure in EOF-extending
+    fallocate
+  smb/client: handle smb2_set_sparse() failure in non-extending
+    fallocate
+  smb/client: do not account EOF extension as allocation
+  smb/client: verify allocation after EOF-extending fallocate
+  smb/client: handle overlapping allocated ranges in fallocate
+  smb/client: reduce fallocate zero buffer allocation
+  smb/client: emulate small sparse fallocate ranges at EOF
+
+ fs/smb/client/inode.c     |  13 ++-
+ fs/smb/client/smb2ops.c   | 181 ++++++++++++++++++++++++++++++--------
+ fs/smb/client/smb2pdu.c   |  19 ++++
+ fs/smb/client/smb2proto.h |   3 +
+ fs/smb/common/fscc.h      |   5 ++
+ 5 files changed, 182 insertions(+), 39 deletions(-)
+
+-- 
+2.43.0
+

@@ -1,0 +1,34 @@
+From 6835176638e8ff31e2eedf9f3e103a982063d966 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 23 Jun 2026 09:54:18 +0800
+Subject: [PATCH v2 1/9] smb/client: name the default fallocate mode
+
+FALLOC_FL_ALLOCATE_RANGE identifies the default fallocate
+allocation mode and is defined as zero.
+
+Use the symbolic name instead of a literal zero in
+smb3_fallocate() to make the mode dispatch clearer. This
+does not change behavior.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+---
+ fs/smb/client/smb2ops.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index a8f8feeeccb5..2964f461fc84 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -4071,7 +4071,7 @@ static long smb3_fallocate(struct file *file, struct cifs_tcon *tcon, int mode,
+ 		return smb3_collapse_range(file, tcon, off, len);
+ 	else if (mode == FALLOC_FL_INSERT_RANGE)
+ 		return smb3_insert_range(file, tcon, off, len);
+-	else if (mode == 0)
++	else if (mode == FALLOC_FL_ALLOCATE_RANGE)
+ 		return smb3_simple_falloc(file, tcon, off, len, false);
+ 
+ 	return -EOPNOTSUPP;
+-- 
+2.43.0
+
