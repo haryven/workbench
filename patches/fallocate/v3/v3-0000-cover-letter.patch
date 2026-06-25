@@ -1,0 +1,43 @@
+From 977322d715e33c8048a01e2e1ec0430b01350339 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 25 Jun 2026 23:09:30 +0800
+Subject: [PATCH v3 0/9] smb/client: fix mode 0 fallocate handling
+
+Changes in v3:
+
+- Move the v2 patch 6 to patch 9, so AllocationSize verification runs after
+  the zero-write emulation fixes.
+- Extend the v2 patch 9 and move it to patch 8.  It now also handles small
+  mode 0 fallocate ranges past EOF, preserving the intervening hole for the
+  generic/213 case.
+- Update the related commit messages and test notes.
+
+Thanks,
+Huiwen He
+
+Link to v2:
+https://lore.kernel.org/linux-cifs/20260624021550.1548952-1-huiwen.he@linux.dev
+
+Huiwen He (9):
+  smb/client: name the default fallocate mode
+  smb/client: preserve errors from smb2_set_sparse()
+  smb/client: handle smb2_set_sparse() failure in EOF-extending
+    fallocate
+  smb/client: handle smb2_set_sparse() failure in non-extending
+    fallocate
+  smb/client: do not account EOF extension as allocation
+  smb/client: handle overlapping allocated ranges in fallocate
+  smb/client: reduce fallocate zero buffer allocation
+  smb/client: emulate small mode 0 fallocate ranges at or past EOF
+  smb/client: verify allocation after EOF-extending fallocate
+
+ fs/smb/client/inode.c     |  13 ++-
+ fs/smb/client/smb2ops.c   | 183 ++++++++++++++++++++++++++++++--------
+ fs/smb/client/smb2pdu.c   |  19 ++++
+ fs/smb/client/smb2proto.h |   3 +
+ fs/smb/common/fscc.h      |   5 ++
+ 5 files changed, 184 insertions(+), 39 deletions(-)
+
+-- 
+2.43.0
+
