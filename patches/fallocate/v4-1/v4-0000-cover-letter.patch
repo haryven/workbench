@@ -1,0 +1,45 @@
+From 81939cdcb93ed7ebcc4a1b416939a72040707e0d Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Fri, 26 Jun 2026 17:35:27 +0800
+Subject: [PATCH v4 0/7] smb/client: fix fallocate and allocation accounting
+
+Changes in v4:
+
+- Add new patch 1 to refresh i_blocks after successful duplicate-extents.
+  This fixes stale st_blocks after reflink and avoids the generic/370
+  swapon hole-check regression.
+
+The following patches from v2 have already been merged into cifs-2.6.git for-next:
+  - smb/client: do not account EOF extension as allocation
+  - smb/client: preserve errors from smb2_set_sparse()
+  - smb/client: name the default fallocate mode
+
+Link to v3:
+https://lore.kernel.org/linux-cifs/20260625160154.104450-1-huiwen.he@linux.dev
+
+Link to v2:
+https://lore.kernel.org/linux-cifs/20260624021550.1548952-1-huiwen.he@linux.dev
+
+Thanks,
+Huiwen
+
+Huiwen He (7):
+  smb/client: refresh allocation size after duplicate extents
+  smb/client: handle smb2_set_sparse() failure in EOF-extending
+    fallocate
+  smb/client: handle smb2_set_sparse() failure in non-extending
+    fallocate
+  smb/client: handle overlapping allocated ranges in fallocate
+  smb/client: reduce fallocate zero buffer allocation
+  smb/client: emulate small mode 0 fallocate ranges at or past EOF
+  smb/client: verify allocation after EOF-extending fallocate
+
+ fs/smb/client/smb2ops.c   | 169 +++++++++++++++++++++++++++++++++-----
+ fs/smb/client/smb2pdu.c   |  19 +++++
+ fs/smb/client/smb2proto.h |   3 +
+ fs/smb/common/fscc.h      |   5 ++
+ 4 files changed, 175 insertions(+), 21 deletions(-)
+
+-- 
+2.43.0
+
