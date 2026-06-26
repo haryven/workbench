@@ -1,0 +1,42 @@
+From 54f7afe404d7f8d45018e9c2e21fadfe37257cc0 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 22 Jun 2026 17:44:26 +0800
+Subject: [PATCH v4 04/10] smb/client: handle smb2_set_sparse() failure in
+ non-extending fallocate
+
+A non-extending fallocate on a sparse file can return success while the
+requested range still contains holes. This affects FALLOC_FL_ALLOCATE_RANGE
+within EOF and FALLOC_FL_KEEP_SIZE when CIFS clears the sparse attribute.
+Later writes into the range may still fail.
+
+CIFS emulates these requests by clearing the sparse attribute for the
+whole file. However, it ignores failure from smb2_set_sparse() and returns
+success unconditionally.
+
+Return the smb2_set_sparse() error. This prevents CIFS from reporting
+successful preallocation when the server rejected FSCTL_SET_SPARSE.
+
+Fixes: f16994797ea8 ("cifs: fix incorrect handling of smb2_set_sparse() return in smb3_simple_falloc")
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+---
+ fs/smb/client/smb2ops.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index f68c0df1b66e..b8474ed9af16 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -3770,8 +3770,7 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
+ 		}
+ 	}
+ 
+-	smb2_set_sparse(xid, tcon, cfile, inode, false);
+-	rc = 0;
++	rc = smb2_set_sparse(xid, tcon, cfile, inode, false);
+ 
+ out:
+ 	if (rc)
+-- 
+2.43.0
+
