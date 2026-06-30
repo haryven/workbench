@@ -1,0 +1,100 @@
+From b43c171d6c7822630a716b0130a761eae1c6d7e0 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Fri, 26 Jun 2026 11:26:53 +0800
+Subject: [PATCH v5 1/4] smb/client: refresh allocation size after duplicate
+ extents
+
+FSCTL_DUPLICATE_EXTENTS_TO_FILE changes the target file extents on the
+server, but the client does not refresh the target AllocationSize/i_blocks.
+Callers can observe or use the wrong st_blocks value immediately after the
+clone, before a later attribute revalidation corrects it.
+
+For example, create a reflinked file with a leading hole:
+
+        xfs_io -f -c "pwrite -S 0x61 0 64k" src
+        touch dst
+        chmod 600 dst
+        xfs_io -c "reflink src 0 1m 64k" dst
+        mkswap dst
+        swapon dst
+
+The file still has a hole after mkswap:
+
+        /mnt/scratch/dst:
+          [0..7]:       allocated
+          [8..2047]:    hole
+          [2048..2175]: allocated
+
+The server also reports only the allocated ranges:
+
+        server dst size=1114112 blocks=144
+
+but the client reported EOF-derived blocks:
+
+        client dst size=1114112 blocks=2176
+
+and swapon succeeded:
+
+        swapon_result=success
+        /mnt/scratch/dst 1.1M 0B -1
+
+So EOF-derived i_blocks can let a sparse reflinked file pass the CIFS
+swapfile hole check.
+
+Fix this by querying FILE_ALL_INFORMATION on the target handle after a
+successful duplicate extents request and updating i_blocks from the
+returned AllocationSize. If the query fails, invalidate the cached
+inode attributes so a later getattr can refresh them.
+
+This also fixes the xfstests generic/370 regression introduced by the
+i_blocks accounting change, as tested on a Samba "vfs objects = btrfs"
+share.
+
+Fixes: 99cd0a6eeb6c ("smb/client: do not account EOF extension as allocation")
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+---
+ fs/smb/client/smb2ops.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index 06e9322a762a..cc8e0595e504 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -2193,10 +2193,13 @@ smb2_duplicate_extents(const unsigned int xid,
+ 			u64 len, u64 dest_off)
+ {
+ 	int rc;
++	int qrc;
+ 	unsigned int ret_data_len;
+ 	struct inode *inode;
++	struct smb2_file_all_info file_inf;
+ 	struct duplicate_extents_to_file dup_ext_buf;
+ 	struct cifs_tcon *tcon = tlink_tcon(trgtfile->tlink);
++	u64 asize;
+ 
+ 	/* server fileays advertise duplicate extent support with this flag */
+ 	if ((le32_to_cpu(tcon->fsAttrInfo.Attributes) &
+@@ -2232,6 +2235,19 @@ smb2_duplicate_extents(const unsigned int xid,
+ 	if (ret_data_len > 0)
+ 		cifs_dbg(FYI, "Non-zero response length in duplicate extents\n");
+ 
++	if (rc == 0) {
++		qrc = SMB2_query_info(xid, tcon, trgtfile->fid.persistent_fid,
++				      trgtfile->fid.volatile_fid, &file_inf);
++		spin_lock(&inode->i_lock);
++		if (qrc == 0) {
++			asize = le64_to_cpu(file_inf.AllocationSize);
++			inode->i_blocks = CIFS_INO_BLOCKS(asize);
++		} else {
++			CIFS_I(inode)->time = 0; /* force reval */
++		}
++		spin_unlock(&inode->i_lock);
++	}
++
+ duplicate_extents_out:
+ 	if (rc)
+ 		trace_smb3_clone_err(xid, srcfile->fid.volatile_fid,
+-- 
+2.43.0
+

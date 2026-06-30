@@ -1,0 +1,50 @@
+From 145878d4744c273a423e8ca4bb592485b09038a9 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 30 Jun 2026 15:57:39 +0800
+Subject: [PATCH v5 0/4] smb/client: fix fallocate and allocation accounting
+
+Changes in v5:
+
+- Update patch 1 commit message to mention the generic/370 regression fix.
+- Update patch 3 commit message to clarify the small EOF-extending mode 0
+  fallocate case.
+- Rework patch 4 to refresh AllocationSize after SetEOF instead of failing
+  when AllocationSize does not grow, preserving compatibility with Samba
+  "strict allocate = no" for requests such as "falloc 0 5M". This makes
+  generic/496 and generic/701 pass on ksmbd.
+
+- Drop the overlapping allocated ranges patch. It was a Sashiko review
+  cleanup suggestion, not a fix for a reproducible Samba or ksmbd failure.
+
+The following patches from v4 are dropped in v5:
+  - smb/client: handle smb2_set_sparse() failure in EOF-extending fallocate
+  - smb/client: handle smb2_set_sparse() failure in non-extending fallocate
+  - smb/client: handle overlapping allocated ranges in fallocate
+
+The following patches are already in upstream and are not resent:
+  - smb/client: name the default fallocate mode
+  - smb/client: preserve errors from smb2_set_sparse()
+  - smb/client: do not account EOF extension as allocation
+
+Link to v4:
+https://lore.kernel.org/linux-cifs/20260626134719.158270-1-huiwen.he@linux.dev
+
+Thanks,
+Huiwen
+
+Huiwen He (4):
+  smb/client: refresh allocation size after duplicate extents
+  smb/client: reduce fallocate zero buffer allocation
+  smb/client: emulate small EOF-extending mode 0 fallocate ranges
+  smb/client: refresh allocation after EOF-extending fallocate
+
+ fs/smb/client/smb2ops.c   | 128 +++++++++++++++++++++++++++++++++++---
+ fs/smb/client/smb2pdu.c   |  19 ++++++
+ fs/smb/client/smb2proto.h |   3 +
+ fs/smb/common/fscc.h      |   5 ++
+ fs/smb/server/smb2pdu.h   |   4 --
+ 5 files changed, 146 insertions(+), 13 deletions(-)
+
+-- 
+2.43.0
+
