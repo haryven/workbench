@@ -1,0 +1,38 @@
+From c5ebef9c77701b3265bffc8d27432b4e6a5f6916 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Wed, 1 Jul 2026 18:11:23 +0800
+Subject: [PATCH v6 5/5] smb/server: map SET_INFO ENOSPC to disk full
+
+FILE_ALLOCATION_INFORMATION can call vfs_fallocate(). If the allocation
+cannot be satisfied, vfs_fallocate() returns -ENOSPC.
+
+smb2_set_info() did not map -ENOSPC, so ksmbd returned a generic SMB error
+and the client reported EIO instead of ENOSPC. This makes the ENOSPC step
+in xfstests generic/213 fail.
+
+Map -ENOSPC and -EFBIG to STATUS_DISK_FULL in the SET_INFO error path.
+
+Tested with xfstests generic/213 on ksmbd.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+---
+ fs/smb/server/smb2pdu.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index 5859fa68bb84..8bd8f348d0e3 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -7077,6 +7077,8 @@ int smb2_set_info(struct ksmbd_work *work)
+ 		rsp->hdr.Status = STATUS_INVALID_PARAMETER;
+ 	else if (rc == -EMSGSIZE)
+ 		rsp->hdr.Status = STATUS_INFO_LENGTH_MISMATCH;
++	else if (rc == -ENOSPC || rc == -EFBIG)
++		rsp->hdr.Status = STATUS_DISK_FULL;
+ 	else if (rc == -ESHARE)
+ 		rsp->hdr.Status = STATUS_SHARING_VIOLATION;
+ 	else if (rc == -ENOENT)
+-- 
+2.43.0
+

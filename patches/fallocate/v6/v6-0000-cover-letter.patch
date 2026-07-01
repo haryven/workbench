@@ -1,0 +1,39 @@
+From c5ebef9c77701b3265bffc8d27432b4e6a5f6916 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Wed, 1 Jul 2026 22:41:42 +0800
+Subject: [PATCH v6 0/5] smb: fix fallocate and allocation accounting
+
+Changes in v6:
+
+- Rework patch 4 to remove the client-side statfs ENOSPC precheck. The
+  server should report ENOSPC from the real allocation attempt; this fixes
+  the xfstests generic/103 regression and keeps the generic/213 ENOSPC
+  failure exposed with Samba "strict allocate = no".
+
+- Add patch 5 to fix generic/213 on ksmbd by mapping SET_INFO
+  -ENOSPC/-EFBIG to STATUS_DISK_FULL.
+
+Link to v5:
+https://lore.kernel.org/linux-cifs/20260630104010.571140-1-huiwen.he@linux.dev
+
+Thanks,
+Huiwen
+
+Huiwen He (5):
+  smb/client: refresh allocation size after duplicate extents
+  smb/client: reduce fallocate zero buffer allocation
+  smb/client: emulate small EOF-extending mode 0 fallocate ranges
+  smb/client: refresh allocation after EOF-extending fallocate
+  smb/server: map SET_INFO ENOSPC to disk full
+
+ fs/smb/client/smb2ops.c   | 116 +++++++++++++++++++++++++++++++++++---
+ fs/smb/client/smb2pdu.c   |  19 +++++++
+ fs/smb/client/smb2proto.h |   3 +
+ fs/smb/common/fscc.h      |   5 ++
+ fs/smb/server/smb2pdu.c   |   2 +
+ fs/smb/server/smb2pdu.h   |   4 --
+ 6 files changed, 136 insertions(+), 13 deletions(-)
+
+-- 
+2.43.0
+
