@@ -1,0 +1,47 @@
+From 26068afd92307c55d4c1c9370fc42e040a5e4ec7 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 2 Jul 2026 22:36:34 +0800
+Subject: [PATCH v7 0/4] smb: fix fallocate and allocation accounting
+
+Changes in v7:
+
+- Rework Patch 1 to keeps the duplicate-extents QueryInfo result valid in
+  the inode cache, avoiding duplicate revalidation when userspace stats
+  the cloned file.
+
+- Rework Patch 3 to no longer uses FSCTL_QUERY_ALLOCATED_RANGES for small
+  fallocate ranges that start at or beyond EOF. These ranges are now
+  zero-written directly because there are no old allocated ranges to
+  preserve there.
+
+The following patch merged into #ksmbd-for-next-next is not resent:
+  - smb/server: map SET_INFO ENOSPC to disk full
+
+The following patches are already in upstream and are not resent:
+  - 898d280f4e4d smb/client: name the default fallocate mode
+  - 2a4b3d2db5c6 smb/client: preserve errors from smb2_set_sparse()
+  - 99cd0a6eeb6c smb/client: do not account EOF extension as allocation
+
+Link to v6:
+https://lore.kernel.org/linux-cifs/20260701152157.822207-1-huiwen.he@linux.dev/
+
+Thanks,
+Huiwen
+
+Huiwen He (4):
+  smb/client: refresh allocation size after duplicate extents
+  smb/client: reduce fallocate zero buffer allocation
+  smb/client: emulate small EOF-extending mode 0 fallocate ranges
+  smb/client: refresh allocation after EOF-extending fallocate
+
+ fs/smb/client/cifsfs.c    |  10 ++-
+ fs/smb/client/smb2ops.c   | 147 ++++++++++++++++++++++++++++++++++----
+ fs/smb/client/smb2pdu.c   |  19 +++++
+ fs/smb/client/smb2proto.h |   3 +
+ fs/smb/common/fscc.h      |   5 ++
+ fs/smb/server/smb2pdu.h   |   4 --
+ 6 files changed, 167 insertions(+), 21 deletions(-)
+
+-- 
+2.43.0
+
