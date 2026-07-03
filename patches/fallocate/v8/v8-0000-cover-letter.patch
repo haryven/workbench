@@ -1,0 +1,49 @@
+From ad668f737303a8f2ea24b4046be414beac3f0ff9 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Fri, 3 Jul 2026 12:17:05 +0800
+Subject: [PATCH v8 0/5] smb: fix fallocate and allocation accounting
+
+Changes in v8:
+
+- Add back the overlapping allocated-range fix as patch 2. This patch
+  was dropped after v5, but it addresses Shashiko's review comments
+  about overlapping allocated ranges and malformed range lengths.
+
+  Although I could not reproduce this locally, a malicious or unusualserver
+  could theoretically return such a range.
+
+- Rebase the later patches on top of the restored patch 2. No other
+  behavior change is intended.
+
+The following patch merged into #ksmbd-for-next-next is not resent:
+  - smb/server: map SET_INFO ENOSPC to disk full
+
+The following patches are already in upstream and are not resent:
+  - 898d280f4e4d smb/client: name the default fallocate mode
+  - 2a4b3d2db5c6 smb/client: preserve errors from smb2_set_sparse()
+  - 99cd0a6eeb6c smb/client: do not account EOF extension as allocation
+
+Link to v7:
+https://lore.kernel.org/linux-cifs/20260702151255.886945-1-huiwen.he@linux.dev
+
+Thanks,
+Huiwen
+
+Huiwen He (5):
+  smb/client: refresh allocation size after duplicate extents
+  smb/client: handle overlapping allocated ranges in fallocate
+  smb/client: reduce fallocate zero buffer allocation
+  smb/client: emulate small EOF-extending mode 0 fallocate ranges
+  smb/client: refresh allocation after EOF-extending fallocate
+
+ fs/smb/client/cifsfs.c    |  10 ++-
+ fs/smb/client/smb2ops.c   | 172 +++++++++++++++++++++++++++++++++-----
+ fs/smb/client/smb2pdu.c   |  19 +++++
+ fs/smb/client/smb2proto.h |   3 +
+ fs/smb/common/fscc.h      |   5 ++
+ fs/smb/server/smb2pdu.h   |   4 -
+ 6 files changed, 185 insertions(+), 28 deletions(-)
+
+-- 
+2.43.0
+
