@@ -1,7 +1,7 @@
-From fab0ff13b2e9405a3daeb4778c513a114ac1e9c5 Mon Sep 17 00:00:00 2001
+From 01f21860ec1690bcf8b1c0e80b5f8479e71cea61 Mon Sep 17 00:00:00 2001
 From: Huiwen He <hehuiwen@kylinos.cn>
 Date: Wed, 15 Jul 2026 22:32:56 +0800
-Subject: [PATCH] smb/client: flush dirty data before zeroing a range
+Subject: [PATCH] smb/client: preflush dirty data before zero-range requests
 
 Before this change, smb3_zero_range() only flushed dirty data when
 the target range reached the server-side EOF. Otherwise,
@@ -27,6 +27,7 @@ code preserved it.
 
 Fixes: 6b69040247e1 ("cifs/smb3: Fix data inconsistent when zero file range")
 Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
 ---
  fs/smb/client/smb2ops.c | 10 +++++++---
  1 file changed, 7 insertions(+), 3 deletions(-)
