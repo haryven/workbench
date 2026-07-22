@@ -1,0 +1,29 @@
+From 5a59403e4716e3aae833e90684e489ca3d642a57 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Wed, 22 Jul 2026 16:22:52 +0800
+Subject: [PATCH 0/2] smb/client: handle compression flags through fileattr
+
+This series moves CIFS compression flag updates to the generic VFS
+fileattr path.
+
+- Patch1 implements ->fileattr_set for CIFS compression flags so
+  FS_IOC_SETFLAGS uses the generic VFS permission and serialization checks.
+
+- Patch 2 removes the old FS_IOC_GETFLAGS and FS_IOC_SETFLAGS
+  handlers from cifs_ioctl(), which are no longer reachable.
+
+Thanks,
+Huiwen
+
+Huiwen He (2):
+  smb/client: implement fileattr_set for compression flags
+  smb/client: remove unused file flags ioctl handlers
+
+ fs/smb/client/cifsfs.c |   6 +-
+ fs/smb/client/cifsfs.h |   2 +
+ fs/smb/client/ioctl.c  | 165 ++++++++++++++++++-----------------------
+ 3 files changed, 79 insertions(+), 94 deletions(-)
+
+-- 
+2.43.0
+
