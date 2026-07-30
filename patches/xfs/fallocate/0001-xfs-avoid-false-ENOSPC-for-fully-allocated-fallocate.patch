@@ -1,0 +1,136 @@
+From 2d1af192a66feb7dce57a2c19c3158fd42fb3235 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 30 Jul 2026 16:01:07 +0800
+Subject: [PATCH] xfs: avoid false ENOSPC for fully allocated fallocate ranges
+
+Fallocate can fail when extending EOF over a range previously
+allocated with KEEP_SIZE.
+
+For example, on an XFS filesystem with 7G total capacity:
+
+  $ df -h .
+  Filesystem      Size  Used Avail Use% Mounted on
+  /dev/loop0      7.0G  169M  6.8G   3% /mnt/test
+
+  $ xfs_io -f -c "falloc -k 0 4G" file
+  $ xfs_io -c "falloc 0 4G" file
+  fallocate: No space left on device
+
+The first fallocate has already allocated the whole 4G range and leaves
+about 2.8G free. The second fallocate should only extend EOF without
+allocating more data blocks.
+
+However, xfs_alloc_file_space() reserves space before xfs_bmapi_write()
+checks the existing mappings. The second 4G reservation therefore
+fails with ENOSPC.
+
+Fix this by checking the existing mappings when xfs_alloc_file_space()
+returns -ENOSPC.  If the entire range is covered by written or
+unwritten real extents, proceed with the size update.  Preserve
+-ENOSPC if any hole or delayed allocation remains.
+
+Factor this handling into a helper shared by the allocate-range and
+unshare-range paths.
+
+After this change, both operations succeed:
+
+  $ xfs_io -f -c "falloc -k 0 4G" file
+  $ xfs_io -c "falloc 0 4G" file
+  $ xfs_io -c "falloc -u 0 4G" file
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: Chi Zhiling <chizhiling@kylinos.cn>
+---
+ fs/xfs/xfs_file.c | 62 +++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 845a97c9b063..3bdfeb56efd4 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -1413,6 +1413,64 @@ xfs_falloc_zero_range(
+ 	return xfs_falloc_setsize(file, new_size);
+ }
+ 
++static int
++xfs_falloc_range_is_allocated(
++	struct xfs_inode	*ip,
++	loff_t			offset,
++	loff_t			len,
++	bool			*allocated)
++{
++	struct xfs_mount	*mp = ip->i_mount;
++	struct xfs_bmbt_irec	imap;
++	xfs_fileoff_t		start_fsb = XFS_B_TO_FSBT(mp, offset);
++	xfs_fileoff_t		end_fsb = XFS_B_TO_FSB(mp, offset + len);
++	int			error = 0;
++
++	*allocated = false;
++	xfs_ilock(ip, XFS_ILOCK_SHARED);
++	while (start_fsb < end_fsb) {
++		int			nimaps = 1;
++
++		error = xfs_bmapi_read(ip, start_fsb, end_fsb - start_fsb,
++				       &imap, &nimaps, 0);
++		if (error || nimaps != 1 || !xfs_bmap_is_real_extent(&imap))
++			break;
++
++		start_fsb = imap.br_startoff + imap.br_blockcount;
++	}
++	xfs_iunlock(ip, XFS_ILOCK_SHARED);
++
++	if (!error && start_fsb >= end_fsb)
++		*allocated = true;
++	return error;
++}
++
++static int
++xfs_falloc_alloc_file_space(
++	struct xfs_inode	*ip,
++	loff_t			offset,
++	loff_t			len)
++{
++	bool			allocated;
++	int			error;
++
++	error = xfs_alloc_file_space(ip, offset, len);
++	if (error != -ENOSPC)
++		return error;
++
++	/*
++	 * xfs_alloc_file_space() reserves the requested range before it checks
++	 * the existing mappings. If the range is already fully allocated, the
++	 * reservation can fail even though no more blocks are needed.
++	 */
++	error = xfs_falloc_range_is_allocated(ip, offset, len, &allocated);
++	if (error)
++		return error;
++	if (!allocated)
++		return -ENOSPC;
++	return 0;
++}
++
+ static int
+ xfs_falloc_unshare_range(
+ 	struct file		*file,
+@@ -1432,7 +1490,7 @@ xfs_falloc_unshare_range(
+ 	if (error)
+ 		return error;
+ 
+-	error = xfs_alloc_file_space(XFS_I(inode), offset, len);
++	error = xfs_falloc_alloc_file_space(XFS_I(inode), offset, len);
+ 	if (error)
+ 		return error;
+ 	return xfs_falloc_setsize(file, new_size);
+@@ -1460,7 +1518,7 @@ xfs_falloc_allocate_range(
+ 	if (error)
+ 		return error;
+ 
+-	error = xfs_alloc_file_space(XFS_I(inode), offset, len);
++	error = xfs_falloc_alloc_file_space(XFS_I(inode), offset, len);
+ 	if (error)
+ 		return error;
+ 	return xfs_falloc_setsize(file, new_size);
+-- 
+2.43.0
+
