@@ -1,0 +1,130 @@
+From 797569dd5b5bbc7787a0323260a334a48ee6d178 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Fri, 31 Jul 2026 17:45:39 +0800
+Subject: [PATCH v2] xfs: avoid false ENOSPC for fully allocated fallocate
+ ranges
+
+Fallocate can fail when extending EOF over a range previously
+allocated with KEEP_SIZE.
+
+For example, on an XFS filesystem with 7G total capacity:
+
+  $ df -h .
+  Filesystem      Size  Used Avail Use% Mounted on
+  /dev/loop0      7.0G  169M  6.8G   3% /mnt/test
+
+  $ xfs_io -f -c "falloc -k 0 4G" file
+  $ xfs_io -c "falloc 0 4G" file
+  fallocate: No space left on device
+
+The first fallocate has already allocated the whole 4G range and leaves
+about 2.8G free. The second fallocate should only extend EOF without
+allocating more data blocks.
+
+However, xfs_alloc_file_space() reserves space before xfs_bmapi_write()
+checks the existing mappings. The second 4G reservation therefore
+fails with ENOSPC.
+
+Fix this by walking the existing mappings first. Skip written and
+unwritten real extents, and call xfs_alloc_file_space() only for holes
+or delayed-allocation extents. Factor this into
+xfs_falloc_allocate_space(), shared by the allocate-range and
+unshare-range paths.
+
+After this change, both operations succeed:
+
+  $ xfs_io -f -c "falloc -k 0 4G" file
+  $ xfs_io -c "falloc 0 4G" file
+  $ xfs_io -c "falloc -u 0 4G" file
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: Chi Zhiling <chizhiling@kylinos.cn>
+---
+ fs/xfs/xfs_file.c | 57 +++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 845a97c9b063..bfb37a73661a 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -1413,6 +1413,59 @@ xfs_falloc_zero_range(
+ 	return xfs_falloc_setsize(file, new_size);
+ }
+ 
++/*
++ * Allocate only mappings that are not already backed by physical blocks.
++ * This avoids reserving data space for real extents before
++ * xfs_bmapi_write() discovers the existing mappings.
++ */
++static int
++xfs_falloc_allocate_space(
++	struct xfs_inode	*ip,
++	loff_t			offset,
++	loff_t			len)
++{
++	struct xfs_mount	*mp = ip->i_mount;
++	struct xfs_bmbt_irec	imap;
++	xfs_fileoff_t		start_fsb = XFS_B_TO_FSBT(mp, offset);
++	xfs_fileoff_t		end_fsb = XFS_B_TO_FSB(mp, offset + len);
++	unsigned int		lock_mode;
++	int			error = 0;
++
++	xfs_assert_ilocked(ip, XFS_IOLOCK_EXCL | XFS_MMAPLOCK_EXCL);
++
++	lock_mode = xfs_ilock_data_map_shared(ip);
++	while (start_fsb < end_fsb) {
++		xfs_filblks_t		count_fsb = end_fsb - start_fsb;
++		int			nimaps = 1;
++
++		error = xfs_bmapi_read(ip, start_fsb, count_fsb, &imap,
++				       &nimaps, 0);
++		if (error)
++			break;
++		if (XFS_IS_CORRUPT(mp, nimaps != 1 ||
++				   imap.br_startoff != start_fsb ||
++				   !imap.br_blockcount ||
++				   imap.br_blockcount > count_fsb)) {
++			error = -EFSCORRUPTED;
++			break;
++		}
++
++		start_fsb += imap.br_blockcount;
++		if (xfs_bmap_is_real_extent(&imap))
++			continue;
++
++		xfs_iunlock(ip, lock_mode);
++		error = xfs_alloc_file_space(ip,
++					     XFS_FSB_TO_B(mp, imap.br_startoff),
++					     XFS_FSB_TO_B(mp, imap.br_blockcount));
++		if (error)
++			return error;
++		lock_mode = xfs_ilock_data_map_shared(ip);
++	}
++	xfs_iunlock(ip, lock_mode);
++	return error;
++}
++
+ static int
+ xfs_falloc_unshare_range(
+ 	struct file		*file,
+@@ -1432,7 +1485,7 @@ xfs_falloc_unshare_range(
+ 	if (error)
+ 		return error;
+ 
+-	error = xfs_alloc_file_space(XFS_I(inode), offset, len);
++	error = xfs_falloc_allocate_space(XFS_I(inode), offset, len);
+ 	if (error)
+ 		return error;
+ 	return xfs_falloc_setsize(file, new_size);
+@@ -1460,7 +1513,7 @@ xfs_falloc_allocate_range(
+ 	if (error)
+ 		return error;
+ 
+-	error = xfs_alloc_file_space(XFS_I(inode), offset, len);
++	error = xfs_falloc_allocate_space(XFS_I(inode), offset, len);
+ 	if (error)
+ 		return error;
+ 	return xfs_falloc_setsize(file, new_size);
+-- 
+2.43.0
+
