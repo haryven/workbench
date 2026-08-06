@@ -1,0 +1,89 @@
+From de7cf47be755adab7346f1816248e52b5573505d Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Wed, 5 Aug 2026 16:44:53 +0800
+Subject: [PATCH 2/2] smb/client: avoid dropping a concurrently updated nlink
+
+An unlink or an overwriting rename can incorrectly reduce cached
+i_nlink from one to zero even though one hard link remains.
+
+Suppose target and alias are hard links to the same file. Initially:
+
+  server nlink = 2
+  cached i_nlink = 2
+
+The same deletion can be counted twice as follows:
+
+    CPU A                               CPU B
+    -----                               -----
+    rename(source, target)
+      server nlink: 2 -> 1
+                                        statx(alias,
+                                              AT_STATX_FORCE_SYNC)
+                                          cached i_nlink: 2 -> 1
+    complete rename
+      cifs_drop_nlink()
+      cached i_nlink: 1 -> 0  (wrong)
+
+Reuse the pre-request i_nlink snapshot and drop the cached count after
+success only if it is unchanged. Apply this guard to both unlink and
+overwrite rename. No additional inode state is needed.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/inode.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/fs/smb/client/inode.c b/fs/smb/client/inode.c
+index b8ce54250eeb..bacd4299e6bc 100644
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -1949,12 +1949,16 @@ static unsigned int cifs_get_cached_nlink(struct inode *inode)
+ 	return nlink;
+ }
+ 
+-/* copied from fs/nfs/dir.c with small changes */
++/*
++ * Drop a link only if the cached count did not change while the namespace
++ * request was in flight. A refreshed count may already account for it.
++ */
+ static void
+-cifs_drop_nlink(struct inode *inode)
++cifs_drop_nlink(struct inode *inode, unsigned int old_nlink)
+ {
+ 	spin_lock(&inode->i_lock);
+-	if (inode->i_nlink > 0)
++	if (inode->i_nlink > 0 &&
++	    inode->i_nlink == old_nlink)
+ 		drop_nlink(inode);
+ 	spin_unlock(&inode->i_lock);
+ }
+@@ -2065,7 +2069,7 @@ static int __cifs_unlink(struct inode *dir, struct dentry *dentry, bool sillyren
+ 		if (inode) {
+ 			cifs_mark_open_handles_for_deleted_file(inode, full_path,
+ 								saved_nlink);
+-			cifs_drop_nlink(inode);
++			cifs_drop_nlink(inode, saved_nlink);
+ 		}
+ 	} else if (rc == -ENOENT) {
+ 		if (simple_positive(dentry))
+@@ -2077,7 +2081,7 @@ static int __cifs_unlink(struct inode *dir, struct dentry *dentry, bool sillyren
+ 			if (rc == 0) {
+ 				cifs_mark_open_handles_for_deleted_file(inode, full_path,
+ 									saved_nlink);
+-				cifs_drop_nlink(inode);
++				cifs_drop_nlink(inode, saved_nlink);
+ 			}
+ 		}
+ 	} else if ((rc == -EACCES) && (dosattr == 0) && inode) {
+@@ -2686,7 +2690,7 @@ cifs_rename2(struct mnt_idmap *idmap, struct inode *source_dir,
+ 			} else {
+ 				cifs_mark_open_handles_for_deleted_file(inode, to_name,
+ 									saved_nlink);
+-				cifs_drop_nlink(inode);
++				cifs_drop_nlink(inode, saved_nlink);
+ 				inode_set_ctime_current(inode);
+ 			}
+ 		} else if (rc == -EACCES || rc == -EEXIST) {
+-- 
+2.43.0
+

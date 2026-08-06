@@ -1,0 +1,250 @@
+From c22325682a0d96e3ff8bc5427ffb4d0a2f0e22c9 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Wed, 5 Aug 2026 16:42:35 +0800
+Subject: [PATCH 1/2] smb/client: use pre-request nlink when marking deleted
+ handles
+
+An unlink or an overwriting rename can incorrectly mark handles opened
+through surviving hard links as delete-pending.
+
+Initially, target and alias refer to inode X:
+
+  target_fh -- target --+
+                        +--> inode X (nlink = 2)
+  alias_fh  -- alias  --+
+
+The race is:
+
+  CPU A                                   CPU B
+  -----                                   -----
+  rename(source, target)
+    server removes target
+    inode X nlink: 2 -> 1
+
+                                          statx(alias,
+                                                AT_STATX_FORCE_SYNC)
+                                            cached i_nlink: 2 -> 1
+
+  cifs_mark_open_handles_for_deleted_file()
+    sees i_nlink == 1
+    marks every handle of inode X:
+
+      target_fh: delete-pending            correct
+      alias_fh:  delete-pending            wrong
+
+After the SMB request completes, cifs_mark_open_handles_for_deleted_file()
+reads i_nlink to decide whether to match handles by path or mark every
+open handle. A concurrent attribute revalidation can update i_nlink before
+the helper reads it.
+
+Save i_nlink before sending unlink or rename and pass the snapshot to the
+helper. This preserves the mark-all path for single-link files while
+keeping path matching enabled for files that had multiple links before
+the request.
+
+Fixes: ffceb7640cbf ("smb: client: do not defer close open handles to deleted files")
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/client/cifsproto.h |  3 ++-
+ fs/smb/client/inode.c     | 41 +++++++++++++++++++++++++++++++--------
+ fs/smb/client/misc.c      | 11 ++++++-----
+ fs/smb/client/smb2inode.c |  3 ++-
+ 4 files changed, 43 insertions(+), 15 deletions(-)
+
+diff --git a/fs/smb/client/cifsproto.h b/fs/smb/client/cifsproto.h
+index 00168839c123..2349858b84e2 100644
+--- a/fs/smb/client/cifsproto.h
++++ b/fs/smb/client/cifsproto.h
+@@ -269,7 +269,8 @@ void cifs_close_deferred_file_under_dentry(struct cifs_tcon *tcon,
+ 					   struct dentry *dentry);
+ 
+ void cifs_mark_open_handles_for_deleted_file(struct inode *inode,
+-					     const char *path);
++					     const char *path,
++					     unsigned int nlink);
+ 
+ struct TCP_Server_Info *cifs_get_tcp_session(struct smb3_fs_context *ctx,
+ 					     struct TCP_Server_Info *primary_server);
+diff --git a/fs/smb/client/inode.c b/fs/smb/client/inode.c
+index c66494ad1169..b8ce54250eeb 100644
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -1017,7 +1017,8 @@ cifs_get_file_info(struct file *filp)
+ 		}
+ 		cifs_open_info_to_fattr(&fattr, &data, inode->i_sb);
+ 		if (fattr.cf_flags & CIFS_FATTR_DELETE_PENDING)
+-			cifs_mark_open_handles_for_deleted_file(inode, path);
++			cifs_mark_open_handles_for_deleted_file(inode, path,
++								READ_ONCE(inode->i_nlink));
+ 		break;
+ 	case -EREMOTE:
+ 		cifs_create_junction_fattr(&fattr, inode->i_sb);
+@@ -1325,7 +1326,8 @@ static int cifs_get_fattr(struct cifs_open_info_data *data,
+ 		}
+ 		if (!rc && *inode &&
+ 		    (fattr->cf_flags & CIFS_FATTR_DELETE_PENDING))
+-			cifs_mark_open_handles_for_deleted_file(*inode, full_path);
++			cifs_mark_open_handles_for_deleted_file(*inode, full_path,
++								READ_ONCE((*inode)->i_nlink));
+ 		break;
+ 	case -EREMOTE:
+ 		/* DFS link, no metadata available on this server */
+@@ -1559,7 +1561,8 @@ int smb311_posix_get_inode_info(struct inode **inode,
+ 
+ 	rc = update_inode_info(sb, &fattr, inode);
+ 	if (!rc && fattr.cf_flags & CIFS_FATTR_DELETE_PENDING)
+-		cifs_mark_open_handles_for_deleted_file(*inode, full_path);
++		cifs_mark_open_handles_for_deleted_file(*inode, full_path,
++							READ_ONCE((*inode)->i_nlink));
+ out:
+ 	kfree(fattr.cf_symlink_target);
+ 	return rc;
+@@ -1725,7 +1728,8 @@ struct inode *cifs_root_iget(struct super_block *sb)
+ 	}
+ 
+ 	if (!rc && fattr.cf_flags & CIFS_FATTR_DELETE_PENDING)
+-		cifs_mark_open_handles_for_deleted_file(inode, path);
++		cifs_mark_open_handles_for_deleted_file(inode, path,
++							READ_ONCE(inode->i_nlink));
+ 
+ 	if (rc && tcon->pipe) {
+ 		cifs_dbg(FYI, "ipc connection - fake read inode\n");
+@@ -1934,6 +1938,17 @@ cifs_rename_pending_delete(const char *full_path, struct dentry *dentry,
+ }
+ #endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
+ 
++static unsigned int cifs_get_cached_nlink(struct inode *inode)
++{
++	unsigned int nlink;
++
++	spin_lock(&inode->i_lock);
++	nlink = inode->i_nlink;
++	spin_unlock(&inode->i_lock);
++
++	return nlink;
++}
++
+ /* copied from fs/nfs/dir.c with small changes */
+ static void
+ cifs_drop_nlink(struct inode *inode)
+@@ -1966,6 +1981,7 @@ static int __cifs_unlink(struct inode *dir, struct dentry *dentry, bool sillyren
+ 	__u32 dosattr = 0, origattr = 0;
+ 	struct TCP_Server_Info *server;
+ 	struct iattr *attrs = NULL;
++	unsigned int saved_nlink = 0;
+ 	bool rehash = false;
+ 
+ 	cifs_dbg(FYI, "cifs_unlink, dir=0x%p, dentry=0x%p\n", dir, dentry);
+@@ -2005,6 +2021,8 @@ static int __cifs_unlink(struct inode *dir, struct dentry *dentry, bool sillyren
+ 
+ 	netfs_wait_for_outstanding_io(inode);
+ 	cifs_close_deferred_file_under_dentry(tcon, dentry);
++	if (inode)
++		saved_nlink = cifs_get_cached_nlink(inode);
+ #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
+ 	if (cap_unix(tcon->ses) && (CIFS_UNIX_POSIX_PATH_OPS_CAP &
+ 				le64_to_cpu(tcon->fsUnixInfo.Capability))) {
+@@ -2045,7 +2063,8 @@ static int __cifs_unlink(struct inode *dir, struct dentry *dentry, bool sillyren
+ psx_del_no_retry:
+ 	if (!rc) {
+ 		if (inode) {
+-			cifs_mark_open_handles_for_deleted_file(inode, full_path);
++			cifs_mark_open_handles_for_deleted_file(inode, full_path,
++								saved_nlink);
+ 			cifs_drop_nlink(inode);
+ 		}
+ 	} else if (rc == -ENOENT) {
+@@ -2056,7 +2075,8 @@ static int __cifs_unlink(struct inode *dir, struct dentry *dentry, bool sillyren
+ 			rc = server->ops->rename_pending_delete(full_path,
+ 								dentry, xid);
+ 			if (rc == 0) {
+-				cifs_mark_open_handles_for_deleted_file(inode, full_path);
++				cifs_mark_open_handles_for_deleted_file(inode, full_path,
++									saved_nlink);
+ 				cifs_drop_nlink(inode);
+ 			}
+ 		}
+@@ -2528,6 +2548,8 @@ cifs_rename2(struct mnt_idmap *idmap, struct inode *source_dir,
+ 	struct cifs_sb_info *cifs_sb;
+ 	struct tcon_link *tlink;
+ 	struct cifs_tcon *tcon;
++	struct inode *target_inode = d_inode(target_dentry);
++	unsigned int saved_nlink = 0;
+ 	bool rehash = false;
+ 	unsigned int xid;
+ 	int rc, tmprc;
+@@ -2582,6 +2604,8 @@ cifs_rename2(struct mnt_idmap *idmap, struct inode *source_dir,
+ 		netfs_wait_for_outstanding_io(d_inode(target_dentry));
+ 		cifs_close_deferred_file_under_dentry(tcon, target_dentry);
+ 	}
++	if (target_inode && !S_ISDIR(target_inode->i_mode))
++		saved_nlink = cifs_get_cached_nlink(target_inode);
+ 
+ 	rc = cifs_do_rename(xid, source_dentry, from_name, target_dentry,
+ 			    to_name);
+@@ -2647,7 +2671,7 @@ cifs_rename2(struct mnt_idmap *idmap, struct inode *source_dir,
+ #endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
+ 	if (d_really_is_positive(target_dentry)) {
+ 		if (!rc) {
+-			struct inode *inode = d_inode(target_dentry);
++			struct inode *inode = target_inode;
+ 			/* Update the target link count after rename. */
+ 			if (S_ISDIR(inode->i_mode)) {
+ 				drop_cached_dir_by_name(xid, tcon, to_name, cifs_sb);
+@@ -2660,7 +2684,8 @@ cifs_rename2(struct mnt_idmap *idmap, struct inode *source_dir,
+ 				inode_set_ctime_current(inode);
+ 				inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+ 			} else {
+-				cifs_mark_open_handles_for_deleted_file(inode, to_name);
++				cifs_mark_open_handles_for_deleted_file(inode, to_name,
++									saved_nlink);
+ 				cifs_drop_nlink(inode);
+ 				inode_set_ctime_current(inode);
+ 			}
+diff --git a/fs/smb/client/misc.c b/fs/smb/client/misc.c
+index 46e1382e8e04..a397b8d567a3 100644
+--- a/fs/smb/client/misc.c
++++ b/fs/smb/client/misc.c
+@@ -652,7 +652,8 @@ void cifs_close_deferred_file_under_dentry(struct cifs_tcon *tcon,
+  * so that we do not defer close them.
+  */
+ void cifs_mark_open_handles_for_deleted_file(struct inode *inode,
+-					     const char *path)
++					     const char *path,
++					     unsigned int nlink)
+ {
+ 	struct cifsFileInfo *cfile;
+ 	void *page;
+@@ -663,11 +664,11 @@ void cifs_mark_open_handles_for_deleted_file(struct inode *inode,
+ 	spin_lock(&cinode->open_file_lock);
+ 
+ 	/*
+-	 * note: we need to construct path from dentry and compare only if the
+-	 * inode has any hardlinks. When number of hardlinks is 1, we can just
+-	 * mark all open handles since they are going to be from the same file.
++	 * When there are multiple links, identify handles by the deleted path.
++	 * Namespace operations use a pre-request nlink snapshot because a
++	 * concurrent revalidation may already reflect the deletion.
+ 	 */
+-	if (inode->i_nlink > 1) {
++	if (nlink > 1) {
+ 		list_for_each_entry(cfile, &cinode->openFileList, flist) {
+ 			full_path = build_path_from_dentry(cfile->dentry, page);
+ 			if (!IS_ERR(full_path) && strcmp(full_path, path) == 0)
+diff --git a/fs/smb/client/smb2inode.c b/fs/smb/client/smb2inode.c
+index 213bc298cdf2..21d9b8a23c32 100644
+--- a/fs/smb/client/smb2inode.c
++++ b/fs/smb/client/smb2inode.c
+@@ -1189,7 +1189,8 @@ smb2_unlink(const unsigned int xid, struct cifs_tcon *tcon, const char *name,
+ 	 * take care of degrading leases on handles for deleted files.
+ 	 */
+ 	if (!rc && inode)
+-		cifs_mark_open_handles_for_deleted_file(inode, name);
++		cifs_mark_open_handles_for_deleted_file(inode, name,
++							READ_ONCE(inode->i_nlink));
+ 
+ 	return rc;
+ 
+-- 
+2.43.0
+

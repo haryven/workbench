@@ -1,0 +1,26 @@
+From de7cf47be755adab7346f1816248e52b5573505d Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 6 Aug 2026 17:14:50 +0800
+Subject: [PATCH 0/2] smb/client: fix races with concurrent nlink updates
+
+This series fixes two races caused by concurrent nlink revalidation.
+
+Patch 1 uses the saved nlink to avoid marking handles opened through
+surviving hard links as deleted.
+
+Patch 2 uses the saved nlink to avoid decrementing an already updated
+link count.
+
+Huiwen He (2):
+  smb/client: use pre-request nlink when marking deleted handles
+  smb/client: avoid dropping a concurrently updated nlink
+
+ fs/smb/client/cifsproto.h |  3 ++-
+ fs/smb/client/inode.c     | 57 +++++++++++++++++++++++++++++----------
+ fs/smb/client/misc.c      | 11 ++++----
+ fs/smb/client/smb2inode.c |  3 ++-
+ 4 files changed, 53 insertions(+), 21 deletions(-)
+
+-- 
+2.43.0
+
