@@ -1,0 +1,32 @@
+From 4db92542c52a0530d1e6f0a062a3a042652c423b Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 13 Aug 2026 20:47:44 +0800
+Subject: [PATCH 0/2] smb/client: fix emulated insert range handling
+
+This series fixes two issues in the SMB3 FALLOC_FL_INSERT_RANGE
+emulation.
+
+Patch 1 fixes missing new EOF validation, which allowed RLIMIT_FSIZE to
+be bypassed.
+
+Patch 2 preserves hole semantics for inserted ranges, fixing xfstests
+generic/064 against Samba and ksmbd.
+
+In my Windows Server testing, aligned 64 KiB and 128 KiB insert ranges
+were reported as holes, but generic/064 still fails because it uses
+4 KiB inserts. Azure Files may not pass the test because it does not
+support sparse files.
+
+Thanks,
+Huiwen
+
+Huiwen He (2):
+  smb/client: validate new EOF for insert range
+  smb/client: mark file sparse before emulating insert range
+
+ fs/smb/client/smb2ops.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+-- 
+2.43.0
+

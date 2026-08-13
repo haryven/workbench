@@ -1,0 +1,47 @@
+From 4db92542c52a0530d1e6f0a062a3a042652c423b Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 13 Aug 2026 10:31:39 +0800
+Subject: [PATCH 2/2] smb/client: mark file sparse before emulating insert
+ range
+
+The SMB client emulates FALLOC_FL_INSERT_RANGE with SET_EOF, COPYCHUNK
+and SET_ZERO_DATA.
+
+SET_ZERO_DATA creates a hole only when the file is sparse. On a
+non-sparse file, it clears the inserted range but leaves its blocks
+allocated, causing the extent count check in xfstests generic/064 to
+fail.
+
+Try to mark the file sparse before starting the emulation. As with
+existing file extension paths, ignore SET_SPARSE errors and continue
+with the existing zero-filled behavior.
+
+Tested with xfstests generic/064 against Samba and ksmbd.
+
+Fixes: 7fe6fe95b936 ("cifs: add FALLOC_FL_INSERT_RANGE support")
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+---
+ fs/smb/client/smb2ops.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index bc7dda6d825a..430b6a1a2d92 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -4006,6 +4006,12 @@ static long smb3_insert_range(struct file *file, struct cifs_tcon *tcon,
+ 
+ 	count = old_eof - off;
+ 
++	/*
++	 * SET_ZERO_DATA creates a hole only in a sparse file. Try to mark the file
++	 * sparse, but continue the emulation regardless of the result.
++	 */
++	smb2_set_sparse(xid, tcon, cfile, inode, true);
++
+ 	filemap_invalidate_lock(inode->i_mapping);
+ 	rc = filemap_write_and_wait_range(inode->i_mapping, off, new_eof - 1);
+ 	if (rc < 0)
+-- 
+2.43.0
+
