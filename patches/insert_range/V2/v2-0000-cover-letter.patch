@@ -1,0 +1,51 @@
+From 9e2fda1e9d6d7017588f23f1f704f16264080707 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 20 Aug 2026 11:10:55 +0800
+Subject: [PATCH v2 0/6] smb/client: fix emulated insert/collapse range issues
+
+This series fixes the SMB3 FALLOC_FL_INSERT_RANGE and
+FALLOC_FL_COLLAPSE_RANGE emulation.
+
+Patch 1 validates the new EOF for insert range, which previously allowed
+RLIMIT_FSIZE to be bypassed.
+
+Patch 2 validates the new EOF for zero range when it extends the file.
+
+Patch 3 marks the file sparse before emulating insert range so the
+inserted range becomes a real hole, fixing xfstests generic/064 against
+Samba and ksmbd.
+
+Patch 4 fixes data corruption in emulated insert range by copying
+overlapping ranges from EOF backwards.
+
+Patch 5 fixes integer truncation when the collapse-range copy exceeds
+INT_MAX bytes.
+
+Patch 6 fixes stale page cache after the range emulation, where reads
+returned zeroes instead of the shifted data.
+
+Changes in v2:
+
+- update patch3 to propagate SET_SPARSE fails.
+- Add patch2 and patch4-6.
+ 
+Link to v1:
+https://lore.kernel.org/linux-cifs/20260813132136.366532-1-huiwen.he@linux.dev/
+
+Thanks,
+Huiwen
+
+Huiwen He (6):
+  smb/client: validate new EOF for insert range
+  smb/client: validate new EOF for zero range
+  smb/client: mark file sparse before emulating insert range
+  smb/client: fix data corruption in emulated insert range
+  smb/client: fix integer truncation in collapse range
+  smb/client: fix stale page cache in insert/collapse range
+
+ fs/smb/client/smb2ops.c | 202 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 168 insertions(+), 34 deletions(-)
+
+-- 
+2.43.0
+
