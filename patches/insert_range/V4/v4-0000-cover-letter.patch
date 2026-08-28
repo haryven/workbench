@@ -1,0 +1,37 @@
+From f8445153ca94c19680c6860594ad6699553ea22b Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Fri, 28 Aug 2026 14:47:41 +0800
+Subject: [PATCH v4 0/7] smb/client: fix fallocate range operation issues
+
+This series fixes several issues in SMB3 fallocate range operations,
+including insert range, collapse range, zero range, and punch hole.
+
+Changes in v4:
+- Add Reviewed-by: Namjae Jeon <linkinjeon@kernel.org> to all patches.
+- The contents of patches 1, 2, and 5-7 are unchanged.
+- Patch 3: update commit message to document the server deallocatio
+  granularity limitation.
+- Patch 4: relax the 4 KiB restriction to retain support for smaller
+  insert ranges and update commit message.
+
+Link to v3:
+https://lore.kernel.org/linux-cifs/20260823151053.935889-1-huiwen.he@linux.dev
+
+Thanks,
+Huiwen
+
+Huiwen He (7):
+  smb/client: validate new EOF for insert range
+  smb/client: validate new EOF for zero range
+  smb/client: mark file sparse before emulating insert range
+  smb/client: fix data corruption in emulated insert range
+  smb/client: fix integer truncation in collapse range
+  smb/client: fix stale page cache in insert/collapse range
+  smb/client: invalidate fscache for fallocate range operations
+
+ fs/smb/client/smb2ops.c | 188 ++++++++++++++++++++++++++++++++--------
+ 1 file changed, 154 insertions(+), 34 deletions(-)
+
+-- 
+2.43.0
+
