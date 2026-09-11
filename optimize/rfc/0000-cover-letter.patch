@@ -1,0 +1,21 @@
+From 26fdc609f7792898726510de0df73dae17196129 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Fri, 11 Sep 2026 10:36:12 +0800
+Subject: [RFC PATCH 0/2] optimize: ksmbd workqueue optimize
+
+This series changes the ksmbd I/O workqueue from WQ_PERCPU to
+WQ_UNBOUND with non-strict CPU affinity. The aim is to preserve CPU
+locality while allowing workers to use other CPUs when requests are
+concentrated on a few CPUs.
+
+Huiwen He (2):
+  workqueue: export workqueue attribute helpers for modules
+  ksmbd: use a non-strict CPU-affine unbound I/O workqueue
+
+ fs/smb/server/ksmbd_work.c | 50 ++++++++++++++++++++++++++++++++++++--
+ kernel/workqueue.c         |  3 +++
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+
+-- 
+2.43.0
+

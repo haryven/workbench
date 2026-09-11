@@ -1,0 +1,100 @@
+From 26fdc609f7792898726510de0df73dae17196129 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Fri, 11 Sep 2026 10:30:50 +0800
+Subject: [RFC PATCH 2/2] ksmbd: use a non-strict CPU-affine unbound I/O workqueue
+
+The per-CPU I/O workqueue can limit write throughput when requests
+are concentrated on a few CPUs.
+
+Use an unbound workqueue with non-strict CPU affinity to preserve
+locality while allowing workers to run on other CPUs.
+
+Keep a load-time wq_policy parameter for switching percpu, unbound
+and cpu_affinity. Default to cpu_affinity.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/ksmbd_work.c | 50 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/fs/smb/server/ksmbd_work.c b/fs/smb/server/ksmbd_work.c
+index e2c2f45264be..e30d83addab5 100644
+--- a/fs/smb/server/ksmbd_work.c
++++ b/fs/smb/server/ksmbd_work.c
+@@ -5,7 +5,9 @@
+ 
+ #include <linux/list.h>
+ #include <linux/mm.h>
++#include <linux/moduleparam.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/workqueue.h>
+ 
+ #include "server.h"
+@@ -15,6 +17,12 @@
+ 
+ static struct kmem_cache *work_cache;
+ static struct workqueue_struct *ksmbd_wq;
++static char ksmbd_wq_policy[16] = "cpu_affinity";
++
++module_param_string(wq_policy, ksmbd_wq_policy,
++		    sizeof(ksmbd_wq_policy), 0444);
++MODULE_PARM_DESC(wq_policy,
++		 "ksmbd I/O workqueue policy: percpu, unbound, or cpu_affinity");
+ 
+ static int ksmbd_reserve_iov(struct ksmbd_work *work, int need_iov_cnt)
+ {
+@@ -105,10 +113,48 @@ int ksmbd_work_pool_init(void)
+ 
+ int ksmbd_workqueue_init(void)
+ {
+-	ksmbd_wq = alloc_workqueue("ksmbd-io", WQ_PERCPU, 0);
++	struct workqueue_attrs *attrs;
++	unsigned int flags;
++	int ret;
++
++	if (!strcmp(ksmbd_wq_policy, "percpu"))
++		flags = WQ_PERCPU;
++	else if (!strcmp(ksmbd_wq_policy, "unbound") ||
++		 !strcmp(ksmbd_wq_policy, "cpu_affinity"))
++		flags = WQ_UNBOUND | WQ_SYSFS;
++	else {
++		pr_err("invalid workqueue policy: %s\n", ksmbd_wq_policy);
++		return -EINVAL;
++	}
++
++	ksmbd_wq = alloc_workqueue("ksmbd-io", flags, 0);
+ 	if (!ksmbd_wq)
+ 		return -ENOMEM;
+-	return 0;
++
++	if (strcmp(ksmbd_wq_policy, "cpu_affinity"))
++		return 0;
++
++	attrs = alloc_workqueue_attrs();
++	if (!attrs) {
++		destroy_workqueue(ksmbd_wq);
++		ksmbd_wq = NULL;
++		return -ENOMEM;
++	}
++
++	/*
++	 * Prefer the submitting CPU for locality, but allow the scheduler to
++	 * move workers to other CPUs when requests arrive on only a few CPUs.
++	 */
++	attrs->affn_scope = WQ_AFFN_CPU;
++	attrs->affn_strict = false;
++
++	ret = apply_workqueue_attrs(ksmbd_wq, attrs);
++	if (ret) {
++		destroy_workqueue(ksmbd_wq);
++		ksmbd_wq = NULL;
++	}
++	free_workqueue_attrs(attrs);
++	return ret;
+ }
+ 
+ void ksmbd_workqueue_destroy(void)
+-- 
+2.43.0
+
