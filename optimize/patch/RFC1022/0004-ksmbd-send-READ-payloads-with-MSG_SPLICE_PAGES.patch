@@ -1,0 +1,644 @@
+From 6cfa249c1ca11c12f562fa71e47b8e50de0dacb3 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 15 Oct 2026 09:48:08 +0800
+Subject: [RFC PATCH 4/4] ksmbd: send READ payloads with MSG_SPLICE_PAGES
+
+The TCP send path copies READ payloads that ksmbd has already read into
+its response buffer, adding CPU and memory bandwidth overhead.
+
+Use page-backed READ buffers and MSG_SPLICE_PAGES to avoid this copy.
+Keep the existing copy path as a fallback when page-backed sending is
+not applicable.
+
+Tested with fio on a 128-CPU server with a local 4-vCPU client VM
+(tmpfs, 16 jobs, QD32 per job, libaio, direct=0, cache=none;
+mixed=50/50 R/W). Throughput (MiB/s) and paired changes are medians
+of four runs.
+
+A: read_splice=0; B: read_splice=1.
+
+  Block  Ch  Workload      A MiB/s    B MiB/s  B/A change
+  -----  --  ---------  ---------  ---------  ----------
+  4KiB    1  READ          290.73     282.21      -2.94%
+  4KiB    1  WRITE         193.01     192.84      +1.17%
+  4KiB    1  mixed         238.67     240.15      +0.55%
+  4KiB    2  READ          404.46     404.66      +1.17%
+  4KiB    2  WRITE         334.67     342.19      +0.34%
+  4KiB    2  mixed         338.24     336.34      -0.38%
+  4KiB    4  READ          453.28     456.10      -0.87%
+  4KiB    4  WRITE         415.69     417.24      +0.37%
+  4KiB    4  mixed         396.75     386.93      -1.41%
+  64KiB   1  READ         2162.74    2558.10     +19.56%
+  64KiB   1  WRITE        1976.37    2031.92      +1.26%
+  64KiB   1  mixed        1974.08    2176.16     +10.13%
+  64KiB   2  READ         3246.35    3591.95     +10.58%
+  64KiB   2  WRITE        3222.85    3205.70      -0.66%
+  64KiB   2  mixed        3283.75    3317.22      +0.86%
+  64KiB   4  READ         4227.13    4427.29      +5.01%
+  64KiB   4  WRITE        3089.17    3047.30      -1.36%
+  64KiB   4  mixed        3877.03    3962.34      +2.09%
+  1MiB    1  READ         2126.23    3353.03     +59.40%
+  1MiB    1  WRITE        3452.84    3460.33      +0.25%
+  1MiB    1  mixed        2961.50    3096.88      +4.64%
+  1MiB    2  READ         3887.33    5546.88     +42.10%
+  1MiB    2  WRITE        4158.22    4174.43      +0.18%
+  1MiB    2  mixed        4335.01    4954.98     +18.71%
+  1MiB    4  READ         6707.91    8311.51     +23.28%
+  1MiB    4  WRITE        3557.26    3612.88      +0.38%
+  1MiB    4  mixed        5444.00    5604.89      +3.12%
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/connection.c    |   1 +
+ fs/smb/server/connection.h    |   2 +
+ fs/smb/server/ksmbd_work.c    |  88 ++++++++++++++++++-------
+ fs/smb/server/ksmbd_work.h    |   9 +++
+ fs/smb/server/server.c        |   1 +
+ fs/smb/server/smb2pdu.c       | 120 ++++++++++++++++++++++++++++------
+ fs/smb/server/smb2pdu.h       |   1 +
+ fs/smb/server/transport_tcp.c |  61 +++++++++++++++--
+ 8 files changed, 235 insertions(+), 48 deletions(-)
+
+diff --git a/fs/smb/server/connection.c b/fs/smb/server/connection.c
+index 4cb92d6599ee..4eb59d81f966 100644
+--- a/fs/smb/server/connection.c
++++ b/fs/smb/server/connection.c
+@@ -518,6 +518,7 @@ static int __ksmbd_conn_write(struct ksmbd_work *work,
+ 	tx->iov = work->iov;
+ 	tx->iov_cnt = work->iov_cnt;
+ 	tx->size = get_rfc1002_len(work->iov[0].iov_base) + 4;
++	tx->splice_header_len = work->splice_header_len;
+ 	tx->need_invalidate_rkey = work->need_invalidate_rkey;
+ 	tx->remote_key = work->remote_key;
+ 
+diff --git a/fs/smb/server/connection.h b/fs/smb/server/connection.h
+index a92e0fea0f06..27a8b17bcbb7 100644
+--- a/fs/smb/server/connection.h
++++ b/fs/smb/server/connection.h
+@@ -166,6 +166,8 @@ struct ksmbd_transport_write {
+ 	struct kvec	*iov;
+ 	int		iov_cnt;
+ 	int		size;
++	/* Prefix to copy into a page fragment before the page-backed last iov. */
++	unsigned int	splice_header_len;
+ 	bool		need_invalidate_rkey;
+ 	unsigned int	remote_key;
+ 	int		msg_flags;
+diff --git a/fs/smb/server/ksmbd_work.c b/fs/smb/server/ksmbd_work.c
+index e1b87bc0c949..9bdd9af1b955 100644
+--- a/fs/smb/server/ksmbd_work.c
++++ b/fs/smb/server/ksmbd_work.c
+@@ -35,6 +35,47 @@ bool ksmbd_queue_request(struct ksmbd_work *work, bool use_write_wq)
+ 	return queue_work(wq, &work->work);
+ }
+ 
++struct aux_read *ksmbd_alloc_read_buf(size_t length, bool allow_splice)
++{
++	struct aux_read *ar;
++	size_t alloc_size = ALIGN(length, 8);
++
++	ar = kzalloc_obj(*ar, KSMBD_DEFAULT_GFP);
++	if (!ar)
++		return NULL;
++
++	if (allow_splice && length) {
++		unsigned int order = get_order(alloc_size);
++
++		/* TCP references to tails must keep the whole allocation alive. */
++		if (order <= MAX_PAGE_ORDER)
++			ar->page = alloc_pages(GFP_KERNEL | __GFP_COMP |
++					       __GFP_NORETRY | __GFP_NOWARN, order);
++	}
++	if (ar->page)
++		ar->buf = page_address(ar->page);
++	else
++		ar->buf = kvmalloc(alloc_size, KSMBD_DEFAULT_GFP);
++	if (!ar->buf) {
++		kfree(ar);
++		return NULL;
++	}
++	return ar;
++}
++
++void ksmbd_free_read_buf(struct aux_read *ar)
++{
++	if (!ar)
++		return;
++	if (ar->page) {
++		/* TCP may still own references; never reuse or modify these pages. */
++		put_page(ar->page);
++	} else {
++		kvfree(ar->buf);
++	}
++	kfree(ar);
++}
++
+ static int ksmbd_reserve_iov(struct ksmbd_work *work, int need_iov_cnt)
+ {
+ 	struct kvec *new;
+@@ -92,9 +133,8 @@ void ksmbd_free_work_struct(struct ksmbd_work *work)
+ 	kvfree(work->response_buf);
+ 
+ 	list_for_each_entry_safe(ar, tmp, &work->aux_read_list, entry) {
+-		kvfree(ar->buf);
+ 		list_del(&ar->entry);
+-		kfree(ar);
++		ksmbd_free_read_buf(ar);
+ 	}
+ 
+ 	kfree(work->tr_buf);
+@@ -188,23 +228,14 @@ static inline void __ksmbd_iov_pin(struct ksmbd_work *work, void *ib,
+ 	work->iov_cnt++;
+ }
+ 
+-static int __ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len,
+-			       void *aux_buf, unsigned int aux_size)
++/* On success, work owns ar, including a buffer with no response payload. */
++int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
++			   struct aux_read *ar, unsigned int aux_size)
+ {
+-	struct aux_read *ar = NULL;
+-	int need_iov_cnt = 1;
+-
+-	if (aux_size) {
+-		need_iov_cnt++;
+-		ar = kmalloc_obj(struct aux_read, KSMBD_DEFAULT_GFP);
+-		if (!ar)
+-			return -ENOMEM;
+-	}
++	int need_iov_cnt = aux_size ? 2 : 1;
+ 
+-	if (ksmbd_reserve_iov(work, need_iov_cnt)) {
+-		kfree(ar);
++	if (ksmbd_reserve_iov(work, need_iov_cnt))
+ 		return -ENOMEM;
+-	}
+ 
+ 	/* Plus rfc_length size on first iov */
+ 	if (!work->iov_idx) {
+@@ -218,25 +249,36 @@ static int __ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len,
+ 	inc_rfc1001_len(work->iov[0].iov_base, len);
+ 
+ 	if (aux_size) {
+-		__ksmbd_iov_pin(work, aux_buf, aux_size);
++		__ksmbd_iov_pin(work, ar->buf, aux_size);
+ 		inc_rfc1001_len(work->iov[0].iov_base, aux_size);
+-
+-		ar->buf = aux_buf;
+-		list_add(&ar->entry, &work->aux_read_list);
+ 	}
++	if (ar)
++		list_add(&ar->entry, &work->aux_read_list);
+ 
+ 	return 0;
+ }
+ 
+ int ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len)
+ {
+-	return __ksmbd_iov_pin_rsp(work, ib, len, NULL, 0);
++	return ksmbd_iov_pin_rsp_read(work, ib, len, NULL, 0);
+ }
+ 
+-int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
++int ksmbd_iov_pin_rsp_data(struct ksmbd_work *work, void *ib, int len,
+ 			   void *aux_buf, unsigned int aux_size)
+ {
+-	return __ksmbd_iov_pin_rsp(work, ib, len, aux_buf, aux_size);
++	struct aux_read *ar;
++	int ret;
++
++	if (!aux_size)
++		return ksmbd_iov_pin_rsp(work, ib, len);
++	ar = kzalloc_obj(*ar, KSMBD_DEFAULT_GFP);
++	if (!ar)
++		return -ENOMEM;
++	ar->buf = aux_buf;
++	ret = ksmbd_iov_pin_rsp_read(work, ib, len, ar, aux_size);
++	if (ret)
++		kfree(ar); /* The caller still owns aux_buf. */
++	return ret;
+ }
+ 
+ int allocate_interim_rsp_buf(struct ksmbd_work *work)
+diff --git a/fs/smb/server/ksmbd_work.h b/fs/smb/server/ksmbd_work.h
+index 9f87b6c4393a..26b3d57a8429 100644
+--- a/fs/smb/server/ksmbd_work.h
++++ b/fs/smb/server/ksmbd_work.h
+@@ -13,6 +13,7 @@ struct ksmbd_conn;
+ struct ksmbd_session;
+ struct ksmbd_tree_connect;
+ struct ksmbd_file;
++struct page;
+ 
+ #define KSMBD_WORK_INLINE_IOVS	4
+ 
+@@ -24,6 +25,8 @@ enum {
+ 
+ struct aux_read {
+ 	void *buf;
++	/* Non-NULL for a buffer owned through a compound-page reference. */
++	struct page *page;
+ 	struct list_head entry;
+ };
+ 
+@@ -45,6 +48,8 @@ struct ksmbd_work {
+ 	int				iov_alloc_cnt;
+ 	int				iov_cnt;
+ 	int				iov_idx;
++	/* Final response prefix before a page-backed last iov; zero disables splice. */
++	unsigned int		splice_header_len;
+ 	struct kvec			iov_inline[KSMBD_WORK_INLINE_IOVS];
+ 
+ 	/* Next cmd hdr in compound req buf*/
+@@ -149,6 +154,8 @@ static inline void *ksmbd_req_buf_next(struct ksmbd_work *work)
+ 
+ struct ksmbd_work *ksmbd_alloc_work_struct(void);
+ void ksmbd_free_work_struct(struct ksmbd_work *work);
++struct aux_read *ksmbd_alloc_read_buf(size_t length, bool allow_splice);
++void ksmbd_free_read_buf(struct aux_read *ar);
+ 
+ void ksmbd_work_pool_destroy(void);
+ int ksmbd_work_pool_init(void);
+@@ -159,6 +166,8 @@ bool ksmbd_queue_work(struct ksmbd_work *work);
+ extern bool ksmbd_write_wq_enabled;
+ bool ksmbd_queue_request(struct ksmbd_work *work, bool use_write_wq);
+ int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
++			   struct aux_read *ar, unsigned int aux_size);
++int ksmbd_iov_pin_rsp_data(struct ksmbd_work *work, void *ib, int len,
+ 			   void *aux_buf, unsigned int aux_size);
+ int ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len);
+ int allocate_interim_rsp_buf(struct ksmbd_work *work);
+diff --git a/fs/smb/server/server.c b/fs/smb/server/server.c
+index 5347eba916ed..70cad4e0e8e2 100644
+--- a/fs/smb/server/server.c
++++ b/fs/smb/server/server.c
+@@ -351,6 +351,7 @@ static void __handle_ksmbd_work(struct ksmbd_work *work,
+ 	if (work->sess)
+ 		ksmbd_user_session_put(work->sess);
+ 
++	smb2_set_read_splice(work);
+ 	ksmbd_conn_write(work);
+ }
+ 
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index 54ecdd096bd2..3d139c686393 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -14,6 +14,8 @@
+ #include <linux/ethtool.h>
+ #include <linux/falloc.h>
+ #include <linux/mount.h>
++#include <linux/mm.h>
++#include <linux/module.h>
+ #include <linux/filelock.h>
+ #include <linux/fileattr.h>
+ #include <linux/timekeeping.h>
+@@ -47,6 +49,29 @@
+ #include "transport_tcp.h"
+ #include "compress.h"
+ 
++/* Switching affects allocation, not ownership of existing READ buffers. */
++static bool read_splice;
++
++static int read_splice_set(const char *val, const struct kernel_param *kp)
++{
++	bool enabled;
++	int ret;
++
++	ret = kstrtobool(val ?: "1", &enabled);
++	if (!ret)
++		WRITE_ONCE(*(bool *)kp->arg, enabled);
++	return ret;
++}
++
++static const struct kernel_param_ops read_splice_ops = {
++	.flags = KERNEL_PARAM_OPS_FL_NOARG,
++	.set = read_splice_set,
++	.get = param_get_bool,
++};
++module_param_cb(read_splice, &read_splice_ops, &read_splice, 0644);
++__MODULE_PARM_TYPE(read_splice, "bool");
++MODULE_PARM_DESC(read_splice, "Page-backed ordinary TCP READ sends");
++
+ static void __wbuf(struct ksmbd_work *work, void **req, void **rsp)
+ {
+ 	if (work->next_smb2_rcv_hdr_off) {
+@@ -7700,9 +7725,9 @@ static int smb2_get_info_sec(struct ksmbd_work *work,
+ 	if (rc)
+ 		goto err_out;
+ 
+-	rc = ksmbd_iov_pin_rsp_read(work, (void *)rsp,
+-			offsetof(struct smb2_query_info_rsp, Buffer),
+-			pntsd, secdesclen);
++	rc = ksmbd_iov_pin_rsp_data(work, (void *)rsp,
++				    offsetof(struct smb2_query_info_rsp, Buffer),
++				    pntsd, secdesclen);
+ err_out:
+ 	if (rc) {
+ 		rsp->OutputBufferLength = 0;
+@@ -8684,7 +8709,7 @@ static noinline int smb2_read_pipe(struct ksmbd_work *work)
+ 			       rpc_resp->payload_sz);
+ 
+ 		nbytes = rpc_resp->payload_sz;
+-		err = ksmbd_iov_pin_rsp_read(work, (void *)rsp,
++		err = ksmbd_iov_pin_rsp_data(work, (void *)rsp,
+ 					     offsetof(struct smb2_read_rsp, Buffer),
+ 					     aux_payload_buf, nbytes);
+ 		if (err) {
+@@ -9004,6 +9029,63 @@ static ssize_t smb2_read_rdma(struct ksmbd_work *work,
+ 	return length;
+ }
+ 
++void smb2_set_read_splice(struct ksmbd_work *work)
++{
++	const unsigned int prefix_len = sizeof(__be32);
++	const unsigned int rsp_len = offsetof(struct smb2_read_rsp, Buffer);
++	const unsigned int header_len = prefix_len + rsp_len;
++	const struct smb2_read_rsp *rsp;
++	const struct kvec *payload;
++	const struct aux_read *ar;
++
++	work->splice_header_len = 0;
++	if (!list_is_singular(&work->aux_read_list))
++		return;
++	ar = list_first_entry(&work->aux_read_list, struct aux_read, entry);
++	/* Only eligible TCP READs allocate a page-backed auxiliary buffer. */
++	if (!ar->page)
++		return;
++
++	/* The final response must still be RFC1002 length + READ header + data. */
++	if (work->iov_cnt != 3 || work->iov[0].iov_len != prefix_len ||
++	    work->iov[1].iov_len != rsp_len)
++		return;
++	rsp = work->iov[1].iov_base;
++	payload = &work->iov[2];
++
++	/* Signing follows the READ handler; session/tcon refs may be gone. */
++	if (rsp->hdr.Flags & SMB2_FLAGS_SIGNED)
++		return;
++
++	/* Retain the original payload and send only the initialized bytes. */
++	if (payload->iov_base != ar->buf ||
++	    !payload->iov_len ||
++	    payload->iov_len > page_size(ar->page) ||
++	    get_rfc1002_len(work->iov[0].iov_base) + prefix_len !=
++					payload->iov_len + header_len)
++		return;
++
++	/* Do not pin an oversized compound allocation for a short READ. */
++	if (get_order(payload->iov_len) < compound_order(ar->page))
++		return;
++
++	work->splice_header_len = header_len;
++}
++
++static bool smb2_read_splice_eligible(struct ksmbd_work *work,
++				    const struct smb2_read_req *req)
++{
++	/* Negotiated signing/encryption capabilities alone do not exclude READs. */
++	return READ_ONCE(read_splice) &&
++		!work->next_smb2_rcv_hdr_off && !req->hdr.NextCommand &&
++		!work->encrypted &&
++		!work->sess->sign && !work->conn->sign &&
++		!(req->hdr.Flags & SMB2_FLAGS_SIGNED) &&
++		!(req->Flags & SMB2_READFLAG_REQUEST_COMPRESSED) &&
++		req->Channel == SMB2_CHANNEL_NONE &&
++		ksmbd_transport_is_tcp(work->conn->transport);
++}
++
+ /**
+  * smb2_read() - handler for smb2 read from file
+  * @work:	smb work containing read command buffer
+@@ -9013,6 +9095,7 @@ static ssize_t smb2_read_rdma(struct ksmbd_work *work,
+ int smb2_read(struct ksmbd_work *work)
+ {
+ 	struct ksmbd_conn *conn = work->conn;
++	struct aux_read *ar = NULL;
+ 	struct smb2_read_req *req;
+ 	struct smb2_read_rsp *rsp;
+ 	struct ksmbd_file *fp = NULL;
+@@ -9024,7 +9107,6 @@ int smb2_read(struct ksmbd_work *work)
+ 	bool is_rdma_channel = false, async_interim = false;
+ 	unsigned int max_read_size = conn->vals->max_read_size;
+ 	unsigned int id = KSMBD_NO_FID, pid = KSMBD_NO_FID;
+-	void *aux_payload_buf;
+ 
+ 	ksmbd_debug(SMB, "Received smb2 read request\n");
+ 
+@@ -9137,15 +9219,14 @@ int smb2_read(struct ksmbd_work *work)
+ 	ksmbd_debug(SMB, "filename %pD, offset %lld, len %zu\n",
+ 		    fp->filp, offset, length);
+ 
+-	aux_payload_buf = kvmalloc(ALIGN(length, 8), KSMBD_DEFAULT_GFP);
+-	if (!aux_payload_buf) {
++	ar = ksmbd_alloc_read_buf(length, smb2_read_splice_eligible(work, req));
++	if (!ar) {
+ 		err = -ENOMEM;
+ 		goto out;
+ 	}
+ 
+-	nbytes = ksmbd_vfs_read(work, fp, length, &offset, aux_payload_buf);
++	nbytes = ksmbd_vfs_read(work, fp, length, &offset, ar->buf);
+ 	if (nbytes < 0) {
+-		kvfree(aux_payload_buf);
+ 		err = nbytes;
+ 		goto out;
+ 	}
+@@ -9157,10 +9238,10 @@ int smb2_read(struct ksmbd_work *work)
+ 	 * client.  Zero just that tail.
+ 	 */
+ 	if (nbytes & 7)
+-		memset(aux_payload_buf + nbytes, 0, ALIGN(nbytes, 8) - nbytes);
++		memset(ar->buf + nbytes, 0, ALIGN(nbytes, 8) - nbytes);
+ 
+ 	if ((nbytes == 0 && length != 0) || nbytes < mincount) {
+-		kvfree(aux_payload_buf);
++		ksmbd_free_read_buf(ar);
+ 		rsp->hdr.Status = STATUS_END_OF_FILE;
+ 		smb2_set_err_rsp(work);
+ 		if (async_interim)
+@@ -9175,16 +9256,15 @@ int smb2_read(struct ksmbd_work *work)
+ 	if (is_rdma_channel == true) {
+ 		rdma_transform_len = smb2_prep_rdma_read(work, req,
+ 							 rsp,
+-							 aux_payload_buf,
++							 ar->buf,
+ 							 nbytes);
+ 		if (rdma_transform_len < 0) {
+-			kvfree(aux_payload_buf);
+ 			err = rdma_transform_len;
+ 			goto out;
+ 		}
+ 		/* write data to the client using rdma channel */
+ 		remain_bytes = smb2_read_rdma(work, req,
+-					      aux_payload_buf,
++					      ar->buf,
+ 					      nbytes);
+ 		if (remain_bytes < 0)
+ 			pr_err("RDMA READ transfer failed: session=%llu payload=%zu transform=%d rc=%zd\n",
+@@ -9195,8 +9275,8 @@ int smb2_read(struct ksmbd_work *work)
+ 				    "RDMA READ transfer completed: session=%llu payload=%zu transform=%d\n",
+ 				    work->sess ? work->sess->id : 0, nbytes,
+ 				    rdma_transform_len);
+-		kvfree(aux_payload_buf);
+-		aux_payload_buf = NULL;
++		ksmbd_free_read_buf(ar);
++		ar = NULL;
+ 		nbytes = 0;
+ 		if (remain_bytes < 0) {
+ 			err = (int)remain_bytes;
+@@ -9214,11 +9294,10 @@ int smb2_read(struct ksmbd_work *work)
+ 	err = ksmbd_iov_pin_rsp_read(work, (void *)rsp,
+ 				     offsetof(struct smb2_read_rsp, Buffer) +
+ 				     rdma_transform_len,
+-				     aux_payload_buf, nbytes);
+-	if (err) {
+-		kvfree(aux_payload_buf);
++				     ar, nbytes);
++	if (err)
+ 		goto out;
+-	}
++	ar = NULL; /* The response now owns the buffer. */
+ 	if (async_interim)
+ 		release_async_work(work);
+ 	/*
+@@ -9234,6 +9313,7 @@ int smb2_read(struct ksmbd_work *work)
+ 	return 0;
+ 
+ out:
++	ksmbd_free_read_buf(ar);
+ 	if (async_interim)
+ 		release_async_work(work);
+ 	if (err) {
+diff --git a/fs/smb/server/smb2pdu.h b/fs/smb/server/smb2pdu.h
+index 3f08d1ca5a38..27e60f9ff4db 100644
+--- a/fs/smb/server/smb2pdu.h
++++ b/fs/smb/server/smb2pdu.h
+@@ -429,6 +429,7 @@ bool smb3_encryption_negotiated(struct ksmbd_conn *conn);
+ /* smb2 misc functions */
+ int ksmbd_smb2_check_message(struct ksmbd_work *work);
+ void smb2_complete_request_open(struct ksmbd_work *work);
++void smb2_set_read_splice(struct ksmbd_work *work);
+ 
+ /* smb2 command handlers */
+ int smb2_handle_negotiate(struct ksmbd_work *work);
+diff --git a/fs/smb/server/transport_tcp.c b/fs/smb/server/transport_tcp.c
+index 1183bb75aa24..5acf183dab64 100644
+--- a/fs/smb/server/transport_tcp.c
++++ b/fs/smb/server/transport_tcp.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/freezer.h>
++#include <linux/page_frag_cache.h>
+ 
+ #include "smb_common.h"
+ #include "server.h"
+@@ -32,6 +33,8 @@ static int bind_additional_ifaces;
+ struct tcp_transport {
+ 	struct ksmbd_transport		transport;
+ 	struct socket			*sock;
++	/* Serialized by conn->srv_mutex. */
++	struct page_frag_cache		tx_frag_cache;
+ 	struct kvec			*iov;
+ 	unsigned int			nr_iov;
+ };
+@@ -66,6 +69,7 @@ static struct tcp_transport *alloc_transport(struct socket *client_sk)
+ 	if (!t)
+ 		return NULL;
+ 	t->sock = client_sk;
++	page_frag_cache_init(&t->tx_frag_cache);
+ 
+ 	conn = ksmbd_conn_alloc();
+ 	if (!conn) {
+@@ -100,6 +104,7 @@ static void ksmbd_tcp_free_transport(struct ksmbd_transport *kt)
+ 	struct tcp_transport *t = TCP_TRANS(kt);
+ 
+ 	sock_release(t->sock);
++	page_frag_cache_drain(&t->tx_frag_cache);
+ 	kfree(t->iov);
+ 	kfree(t);
+ }
+@@ -431,6 +436,38 @@ static int ksmbd_tcp_read(struct ksmbd_transport *t, char *buf,
+ 	return ksmbd_tcp_readv(TCP_TRANS(t), &iov, 1, to_read, max_retries);
+ }
+ 
++/* The last iov is page-backed; consolidate the prefix into a page fragment. */
++static void *ksmbd_tcp_build_splice_iov(struct tcp_transport *t,
++				       const struct ksmbd_transport_write *tx,
++				       struct kvec *splice_iov)
++{
++	unsigned int header_len = tx->splice_header_len;
++	const struct kvec *payload;
++	struct iov_iter iter;
++	void *header_frag;
++
++	if (!header_len || header_len > PAGE_SIZE || header_len >= tx->size ||
++	    tx->iov_cnt < 2)
++		return NULL;
++	payload = &tx->iov[tx->iov_cnt - 1];
++	if (payload->iov_len != tx->size - header_len)
++		return NULL;
++
++	header_frag = page_frag_alloc(&t->tx_frag_cache, header_len,
++				 GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
++	if (!header_frag)
++		return NULL;
++	iov_iter_kvec(&iter, ITER_SOURCE, tx->iov, tx->iov_cnt, header_len);
++	if (!copy_from_iter_full(header_frag, header_len, &iter)) {
++		page_frag_free(header_frag);
++		return NULL;
++	}
++	splice_iov[0].iov_base = header_frag;
++	splice_iov[0].iov_len = header_len;
++	splice_iov[1] = *payload;
++	return header_frag;
++}
++
+ static int ksmbd_tcp_writev(struct ksmbd_transport *t,
+ 			    const struct ksmbd_transport_write *tx)
+ {
+@@ -438,21 +475,35 @@ static int ksmbd_tcp_writev(struct ksmbd_transport *t,
+ 		.msg_flags = MSG_NOSIGNAL | tx->msg_flags,
+ 	};
+ 	struct socket *sock = TCP_TRANS(t)->sock;
++	struct kvec splice_iov[2];
++	void *header_frag;
+ 	int ret;
+ 
+-	iov_iter_kvec(&smb_msg.msg_iter, ITER_SOURCE, tx->iov,
+-		      tx->iov_cnt, tx->size);
+-	/* The caller holds srv_mutex across the entire frame. */
++	/* The caller holds srv_mutex across preparation and the entire frame. */
++	header_frag = ksmbd_tcp_build_splice_iov(TCP_TRANS(t), tx, splice_iov);
++	if (header_frag) {
++		iov_iter_kvec(&smb_msg.msg_iter, ITER_SOURCE, splice_iov,
++			      ARRAY_SIZE(splice_iov), tx->size);
++		smb_msg.msg_flags |= MSG_SPLICE_PAGES;
++	} else {
++		iov_iter_kvec(&smb_msg.msg_iter, ITER_SOURCE, tx->iov,
++			      tx->iov_cnt, tx->size);
++	}
+ 	while (iov_iter_count(&smb_msg.msg_iter)) {
+ 		ret = sock_sendmsg(sock, &smb_msg);
+ 		if (ret <= 0) {
+ 			/* Never append another SMB frame to an incomplete one. */
+ 			kernel_sock_shutdown(sock, SHUT_RDWR);
+-			return ret ?: -EIO;
++			ret = ret ?: -EIO;
++			goto out;
+ 		}
+ 	}
+ 
+-	return tx->size;
++	ret = tx->size;
++out:
++	if (header_frag)
++		page_frag_free(header_frag);
++	return ret;
+ }
+ 
+ static void ksmbd_tcp_disconnect(struct ksmbd_transport *t)
+-- 
+2.43.0
+

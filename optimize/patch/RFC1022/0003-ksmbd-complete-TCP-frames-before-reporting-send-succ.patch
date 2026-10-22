@@ -1,0 +1,50 @@
+From 1ca8b3ff5bac348b36a602b9f132bd751d6d4a07 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 15 Oct 2026 09:48:07 +0800
+Subject: [RFC PATCH 3/4] ksmbd: complete TCP frames before reporting send
+ success
+
+A positive kernel_sendmsg() return may cover only part of an SMB frame.
+Reporting success lets the next response follow an incomplete frame.
+
+Retry short sends with the same iterator while holding srv_mutex.
+On zero progress or error, shut down the socket before releasing the
+lock so no later response can follow an incomplete frame.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/transport_tcp.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/fs/smb/server/transport_tcp.c b/fs/smb/server/transport_tcp.c
+index 5a2aad35739d..1183bb75aa24 100644
+--- a/fs/smb/server/transport_tcp.c
++++ b/fs/smb/server/transport_tcp.c
+@@ -437,9 +437,22 @@ static int ksmbd_tcp_writev(struct ksmbd_transport *t,
+ 	struct msghdr smb_msg = {
+ 		.msg_flags = MSG_NOSIGNAL | tx->msg_flags,
+ 	};
++	struct socket *sock = TCP_TRANS(t)->sock;
++	int ret;
++
++	iov_iter_kvec(&smb_msg.msg_iter, ITER_SOURCE, tx->iov,
++		      tx->iov_cnt, tx->size);
++	/* The caller holds srv_mutex across the entire frame. */
++	while (iov_iter_count(&smb_msg.msg_iter)) {
++		ret = sock_sendmsg(sock, &smb_msg);
++		if (ret <= 0) {
++			/* Never append another SMB frame to an incomplete one. */
++			kernel_sock_shutdown(sock, SHUT_RDWR);
++			return ret ?: -EIO;
++		}
++	}
+ 
+-	return kernel_sendmsg(TCP_TRANS(t)->sock, &smb_msg, tx->iov,
+-			      tx->iov_cnt, tx->size);
++	return tx->size;
+ }
+ 
+ static void ksmbd_tcp_disconnect(struct ksmbd_transport *t)
+-- 
+2.43.0
+
