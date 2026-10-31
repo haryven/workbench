@@ -1,0 +1,121 @@
+From 366ef782ec742d7388006c484b4cd1ca69a84919 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Thu, 29 Oct 2026 20:38:23 +0800
+Subject: [PATCH 4/5] ksmbd: accept READ splice policy from startup
+ configuration
+
+The read_splice module parameter does not provide a ksmbd.conf control.
+
+Add a startup flag for the userspace daemon. Explicit module or sysfs
+settings override configuration until module unload, preserving the
+existing test interface. Configuration changes apply at server startup;
+buffer ownership remains independent of later policy changes.
+
+Requires the companion ksmbd-tools parser change. Module build and
+extracted configuration tests passed; end-to-end startup is untested.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/ksmbd_netlink.h |  1 +
+ fs/smb/server/smb2pdu.c       | 24 ++++++++++++++++++++++--
+ fs/smb/server/smb2pdu.h       |  1 +
+ fs/smb/server/transport_ipc.c |  3 +++
+ 4 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/fs/smb/server/ksmbd_netlink.h b/fs/smb/server/ksmbd_netlink.h
+index 2673522c76bc..b9ea81a4c9ed 100644
+--- a/fs/smb/server/ksmbd_netlink.h
++++ b/fs/smb/server/ksmbd_netlink.h
+@@ -79,6 +79,7 @@ struct ksmbd_heartbeat {
+ #define KSMBD_GLOBAL_FLAG_SMB3_MULTICHANNEL	BIT(2)
+ #define KSMBD_GLOBAL_FLAG_SMB2_ENCRYPTION_OFF	BIT(3)
+ #define KSMBD_GLOBAL_FLAG_DURABLE_HANDLE	BIT(4)
++#define KSMBD_GLOBAL_FLAG_READ_SPLICE		BIT(5)
+ 
+ /*
+  * IPC request for ksmbd server startup
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index 4561bc7cf171..e1fe25edc3b7 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -51,6 +51,17 @@
+ 
+ /* Switching affects allocation, not ownership of existing READ buffers. */
+ static bool read_splice;
++static bool read_splice_override;
++static DEFINE_MUTEX(read_splice_config_lock);
++
++void ksmbd_configure_read_splice(bool enabled)
++{
++	mutex_lock(&read_splice_config_lock);
++	/* Explicit module or sysfs settings take precedence over startup config. */
++	if (!read_splice_override)
++		WRITE_ONCE(read_splice, enabled);
++	mutex_unlock(&read_splice_config_lock);
++}
+ 
+ static int read_splice_set(const char *val, const struct kernel_param *kp)
+ {
+@@ -58,15 +69,24 @@ static int read_splice_set(const char *val, const struct kernel_param *kp)
+ 	int ret;
+ 
+ 	ret = kstrtobool(val ?: "1", &enabled);
+-	if (!ret)
++	if (!ret) {
++		mutex_lock(&read_splice_config_lock);
+ 		WRITE_ONCE(*(bool *)kp->arg, enabled);
++		read_splice_override = true;
++		mutex_unlock(&read_splice_config_lock);
++	}
+ 	return ret;
+ }
+ 
++static int read_splice_get(char *buffer, const struct kernel_param *kp)
++{
++	return sprintf(buffer, "%c\n", READ_ONCE(*(bool *)kp->arg) ? 'Y' : 'N');
++}
++
+ static const struct kernel_param_ops read_splice_ops = {
+ 	.flags = KERNEL_PARAM_OPS_FL_NOARG,
+ 	.set = read_splice_set,
+-	.get = param_get_bool,
++	.get = read_splice_get,
+ };
+ module_param_cb(read_splice, &read_splice_ops, &read_splice, 0644);
+ __MODULE_PARM_TYPE(read_splice, "bool");
+diff --git a/fs/smb/server/smb2pdu.h b/fs/smb/server/smb2pdu.h
+index 27e60f9ff4db..83cbf91ffe82 100644
+--- a/fs/smb/server/smb2pdu.h
++++ b/fs/smb/server/smb2pdu.h
+@@ -430,6 +430,7 @@ bool smb3_encryption_negotiated(struct ksmbd_conn *conn);
+ int ksmbd_smb2_check_message(struct ksmbd_work *work);
+ void smb2_complete_request_open(struct ksmbd_work *work);
+ void smb2_set_read_splice(struct ksmbd_work *work);
++void ksmbd_configure_read_splice(bool enabled);
+ 
+ /* smb2 command handlers */
+ int smb2_handle_negotiate(struct ksmbd_work *work);
+diff --git a/fs/smb/server/transport_ipc.c b/fs/smb/server/transport_ipc.c
+index e550aa41ad2c..c17ead235c38 100644
+--- a/fs/smb/server/transport_ipc.c
++++ b/fs/smb/server/transport_ipc.c
+@@ -19,6 +19,7 @@
+ #include "transport_ipc.h"
+ #include "server.h"
+ #include "smb_common.h"
++#include "smb2pdu.h"
+ 
+ #include "mgmt/user_config.h"
+ #include "mgmt/share_config.h"
+@@ -378,6 +379,8 @@ static int ipc_server_config_on_startup(struct ksmbd_startup_request *req)
+ 			server_conf.max_protocol = ret;
+ 	}
+ 
++	ksmbd_configure_read_splice(req->flags & KSMBD_GLOBAL_FLAG_READ_SPLICE);
++
+ 	if (server_conf.ipc_timeout)
+ 		schedule_delayed_work(&ipc_timer_work, server_conf.ipc_timeout);
+ 	return 0;
+-- 
+2.43.0
+

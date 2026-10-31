@@ -1,0 +1,32 @@
+From 773900b7953a77aad8ce7e8b94d4c5ebe405644b Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Sun, 1 Nov 2026 00:14:26 +0800
+Subject: [PATCH 0/5] *** SUBJECT HERE ***
+
+*** BLURB HERE ***
+
+Huiwen He (5):
+  ksmbd: route WRITE requests to an unbound workqueue
+  ksmbd: complete TCP frames before reporting send success
+  ksmbd: send READ payloads with MSG_SPLICE_PAGES
+  ksmbd: accept READ splice policy from startup configuration
+  ksmbd: coalesce completed WRITE responses
+
+ fs/smb/server/connection.c    | 150 ++++++++++++++++++++
+ fs/smb/server/connection.h    |  14 ++
+ fs/smb/server/ksmbd_netlink.h |   1 +
+ fs/smb/server/ksmbd_work.c    | 249 ++++++++++++++++++++++++++++++----
+ fs/smb/server/ksmbd_work.h    |  28 ++++
+ fs/smb/server/server.c        | 113 +++++++++++++--
+ fs/smb/server/smb2pdu.c       | 161 +++++++++++++++++++---
+ fs/smb/server/smb2pdu.h       |   2 +
+ fs/smb/server/transport_ipc.c |   3 +
+ fs/smb/server/transport_tcp.c |  64 ++++++++-
+ fs/smb/server/transport_tcp.h |   1 +
+ fs/smb/server/vfs.c           |  37 ++++-
+ fs/smb/server/vfs.h           |   2 +
+ 13 files changed, 764 insertions(+), 61 deletions(-)
+
+-- 
+2.43.0
+
