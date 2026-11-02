@@ -1,0 +1,206 @@
+From f83c61ae6c45bbcf6d57bff3cd106651a83be6fd Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 2 Nov 2026 10:46:18 +0800
+Subject: [PATCH 6/7] ksmbd: accept WRITE workqueue policy from startup
+ configuration
+
+WRITE placement is workload-sensitive, but enabling its optional queue
+currently requires a module parameter.
+
+Accept a startup flag from ksmbd-tools and prepare the queue before
+starting listeners. An explicit write_wq=0 or write_wq=1 overrides the
+configuration. Keep an allocated queue until module unload and leave
+runtime parameter writes disabled.
+
+Use a new flag bit so an older READ-splice configuration cannot enable
+WRITE routing. READ splice retains its separate module parameter.
+
+Built ksmbd.ko and checked configuration precedence and allocation-failure
+cleanup with extracted functions under ASan/UBSan. Requires the companion
+ksmbd-tools change; live daemon startup remains to be validated.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/ksmbd_netlink.h |  2 +
+ fs/smb/server/ksmbd_work.c    | 75 +++++++++++++++++++++++++++++------
+ fs/smb/server/ksmbd_work.h    |  1 +
+ fs/smb/server/server.c        |  9 ++++-
+ fs/smb/server/smb2pdu.c       |  2 +-
+ 5 files changed, 75 insertions(+), 14 deletions(-)
+
+diff --git a/fs/smb/server/ksmbd_netlink.h b/fs/smb/server/ksmbd_netlink.h
+index 2673522c76bc..a7992eca939b 100644
+--- a/fs/smb/server/ksmbd_netlink.h
++++ b/fs/smb/server/ksmbd_netlink.h
+@@ -79,6 +79,8 @@ struct ksmbd_heartbeat {
+ #define KSMBD_GLOBAL_FLAG_SMB3_MULTICHANNEL	BIT(2)
+ #define KSMBD_GLOBAL_FLAG_SMB2_ENCRYPTION_OFF	BIT(3)
+ #define KSMBD_GLOBAL_FLAG_DURABLE_HANDLE	BIT(4)
++/* Bit 5 was used by the READ splice RFC; do not reuse it. */
++#define KSMBD_GLOBAL_FLAG_WRITE_WQ		BIT(6)
+ 
+ /*
+  * IPC request for ksmbd server startup
+diff --git a/fs/smb/server/ksmbd_work.c b/fs/smb/server/ksmbd_work.c
+index c36c46cad8cb..e1e150b09d8d 100644
+--- a/fs/smb/server/ksmbd_work.c
++++ b/fs/smb/server/ksmbd_work.c
+@@ -18,11 +18,37 @@
+ static struct kmem_cache *work_cache;
+ static struct workqueue_struct *ksmbd_wq;
+ 
+-/* Load-time switch for the WRITE request routing policy. */
++/* Explicit load-time settings take precedence over startup configuration. */
+ bool ksmbd_write_wq_enabled;
+-module_param_named(write_wq, ksmbd_write_wq_enabled, bool, 0444);
++static bool write_wq_override;
++
++static int write_wq_set(const char *val, const struct kernel_param *kp)
++{
++	bool enabled;
++	int ret;
++
++	ret = kstrtobool(val ?: "1", &enabled);
++	if (!ret) {
++		WRITE_ONCE(*(bool *)kp->arg, enabled);
++		write_wq_override = true;
++	}
++	return ret;
++}
++
++static int write_wq_get(char *buffer, const struct kernel_param *kp)
++{
++	return sprintf(buffer, "%c\n", READ_ONCE(*(bool *)kp->arg) ? 'Y' : 'N');
++}
++
++static const struct kernel_param_ops write_wq_ops = {
++	.flags = KERNEL_PARAM_OPS_FL_NOARG,
++	.set = write_wq_set,
++	.get = write_wq_get,
++};
++module_param_cb(write_wq, &write_wq_ops, &ksmbd_write_wq_enabled, 0444);
++__MODULE_PARM_TYPE(write_wq, "bool");
+ MODULE_PARM_DESC(write_wq,
+-		 "Route eligible WRITEs to an unbound workqueue; load-time only");
++		 "Route eligible WRITEs to an unbound workqueue; overrides startup configuration");
+ 
+ static struct workqueue_struct *ksmbd_write_wq;
+ 
+@@ -257,20 +283,14 @@ int ksmbd_work_pool_init(void)
+ 	return 0;
+ }
+ 
+-int ksmbd_workqueue_init(void)
++static int ksmbd_write_workqueue_init(void)
+ {
+ 	struct workqueue_attrs *attrs;
+ 	int ret = -ENOMEM;
+ 
+-	ksmbd_wq = alloc_workqueue("ksmbd-io", WQ_PERCPU, 0);
+-	if (!ksmbd_wq)
+-		return -ENOMEM;
+-	if (!ksmbd_write_wq_enabled)
+-		return 0;
+-
+ 	ksmbd_write_wq = alloc_workqueue("ksmbd-write", WQ_UNBOUND, 0);
+ 	if (!ksmbd_write_wq)
+-		goto destroy_io_wq;
++		return -ENOMEM;
+ 	attrs = alloc_workqueue_attrs();
+ 	if (!attrs)
+ 		goto destroy_write_wq;
+@@ -290,7 +310,38 @@ int ksmbd_workqueue_init(void)
+ destroy_write_wq:
+ 	destroy_workqueue(ksmbd_write_wq);
+ 	ksmbd_write_wq = NULL;
+-destroy_io_wq:
++	return ret;
++}
++
++/* Called at module load or under ctrl_lock, before starting listeners. */
++int ksmbd_configure_write_wq(bool enabled)
++{
++	int ret;
++
++	if (write_wq_override)
++		enabled = READ_ONCE(ksmbd_write_wq_enabled);
++	if (enabled && !ksmbd_write_wq) {
++		ret = ksmbd_write_workqueue_init();
++		if (ret)
++			return ret;
++	}
++
++	/* Keep an existing queue until module unload, including TX continuations. */
++	WRITE_ONCE(ksmbd_write_wq_enabled, enabled);
++	return 0;
++}
++
++int ksmbd_workqueue_init(void)
++{
++	int ret;
++
++	ksmbd_wq = alloc_workqueue("ksmbd-io", WQ_PERCPU, 0);
++	if (!ksmbd_wq)
++		return -ENOMEM;
++	ret = ksmbd_configure_write_wq(ksmbd_write_wq_enabled);
++	if (!ret)
++		return 0;
++
+ 	destroy_workqueue(ksmbd_wq);
+ 	ksmbd_wq = NULL;
+ 	return ret;
+diff --git a/fs/smb/server/ksmbd_work.h b/fs/smb/server/ksmbd_work.h
+index 59d121d96da8..920b9e297ae8 100644
+--- a/fs/smb/server/ksmbd_work.h
++++ b/fs/smb/server/ksmbd_work.h
+@@ -181,6 +181,7 @@ int ksmbd_workqueue_init(void);
+ void ksmbd_workqueue_destroy(void);
+ bool ksmbd_queue_work(struct ksmbd_work *work);
+ extern bool ksmbd_write_wq_enabled;
++int ksmbd_configure_write_wq(bool enabled);
+ bool ksmbd_queue_request(struct ksmbd_work *work, bool use_write_wq);
+ int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
+ 			   struct aux_read *ar, unsigned int aux_size);
+diff --git a/fs/smb/server/server.c b/fs/smb/server/server.c
+index 4bd7ea507701..ba66a924a1b6 100644
+--- a/fs/smb/server/server.c
++++ b/fs/smb/server/server.c
+@@ -451,7 +451,7 @@ static bool ksmbd_use_write_wq(struct ksmbd_work *work)
+ 	struct ksmbd_conn *conn = work->conn;
+ 	enum ksmbd_wq_class wq_class = KSMBD_WQ_BLOCK_WRITE;
+ 
+-	if (!ksmbd_write_wq_enabled)
++	if (!READ_ONCE(ksmbd_write_wq_enabled))
+ 		return false;
+ 
+ 	if (ksmbd_transport_is_tcp(conn->transport))
+@@ -551,6 +551,13 @@ static void server_ctrl_handle_init(struct server_ctrl_struct *ctrl)
+ {
+ 	int ret;
+ 
++	ret = ksmbd_configure_write_wq(server_conf.flags & KSMBD_GLOBAL_FLAG_WRITE_WQ);
++	if (ret) {
++		pr_err("Failed to prepare WRITE workqueue: %d\n", ret);
++		server_queue_ctrl_reset_work();
++		return;
++	}
++
+ 	ksmbd_proc_reset();
+ 	ret = ksmbd_conn_transport_init();
+ 	if (ret) {
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index 4561bc7cf171..2d15f182ec40 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -152,7 +152,7 @@ static int register_session_channel(struct ksmbd_session *sess,
+ 		rc = xa_err(old);
+ 		goto out;
+ 	}
+-	if (ksmbd_write_wq_enabled && count) {
++	if (READ_ONCE(ksmbd_write_wq_enabled) && count) {
+ 		/* Remember the extra channel even if binding later fails. */
+ 		xa_for_each(&sess->ksmbd_chann_list, index, chann)
+ 			WRITE_ONCE(chann->conn->multichannel_seen, true);
+-- 
+2.43.0
+

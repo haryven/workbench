@@ -1,0 +1,34 @@
+From 5fb325aa12e4995e58c612b2637a37d16cf26151 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 2 Nov 2026 12:11:20 +0800
+Subject: [PATCH 0/7] *** SUBJECT HERE ***
+
+*** BLURB HERE ***
+
+Huiwen He (7):
+  workqueue: export attribute and sysfs setup helpers
+  ksmbd: route WRITE requests to an unbound workqueue
+  ksmbd: complete TCP frames before reporting send success
+  ksmbd: send READ payloads with MSG_SPLICE_PAGES
+  ksmbd: coalesce completed WRITE responses
+  ksmbd: accept WRITE workqueue policy from startup configuration
+  ksmbd: experiment with per-connection WRITE placement
+
+ fs/smb/server/connection.c    | 155 ++++++++++++++++
+ fs/smb/server/connection.h    |  19 ++
+ fs/smb/server/ksmbd_netlink.h |   2 +
+ fs/smb/server/ksmbd_work.c    | 321 +++++++++++++++++++++++++++++++---
+ fs/smb/server/ksmbd_work.h    |  31 ++++
+ fs/smb/server/server.c        | 136 ++++++++++++--
+ fs/smb/server/smb2pdu.c       | 141 ++++++++++++---
+ fs/smb/server/smb2pdu.h       |   1 +
+ fs/smb/server/transport_tcp.c |  70 +++++++-
+ fs/smb/server/transport_tcp.h |   2 +
+ fs/smb/server/vfs.c           |  37 +++-
+ fs/smb/server/vfs.h           |   2 +
+ kernel/workqueue.c            |   4 +
+ 13 files changed, 859 insertions(+), 62 deletions(-)
+
+-- 
+2.43.0
+
