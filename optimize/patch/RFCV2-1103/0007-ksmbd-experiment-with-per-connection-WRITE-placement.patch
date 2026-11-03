@@ -1,0 +1,199 @@
+From 5fb325aa12e4995e58c612b2637a37d16cf26151 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 2 Nov 2026 10:46:18 +0800
+Subject: [RFC PATCH v2 7/8] ksmbd: experiment with per-connection WRITE
+ placement
+
+Unbound WRITE execution can lose locality for serial requests, while
+parallel reception and processing can benefit from using other CPUs.
+
+Keep eligible WRITEs per-CPU unless RX observes unfinished processing or
+a local worker reports unread TCP data. Track processing separately from
+response sending and connection references, and choose the queue before
+publishing each request. Retain the mixed-traffic and multichannel guards.
+
+Keep write_wq_adaptive off by default. The observations are advisory; a
+receive hint can outlive non-WRITE traffic. Short burst tests did not
+justify a recovery timer: removing the 4 ms gate did not consistently
+reduce throughput, although 64 KiB burst P99 increased by 5.31%.
+
+Built with W=1 and checked 0 ms reference equivalence, processing counts
+and immediate completion/free with extracted functions under ASan/UBSan.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/connection.c    |  5 +++++
+ fs/smb/server/connection.h    |  5 +++++
+ fs/smb/server/ksmbd_work.c    | 19 +++++++++++++++++++
+ fs/smb/server/ksmbd_work.h    |  2 ++
+ fs/smb/server/server.c        | 16 ++++++++++++++++
+ fs/smb/server/transport_tcp.c |  6 ++++++
+ fs/smb/server/transport_tcp.h |  1 +
+ 7 files changed, 54 insertions(+)
+
+diff --git a/fs/smb/server/connection.c b/fs/smb/server/connection.c
+index 8acd4b059d94..c1eaaf42ebab 100644
+--- a/fs/smb/server/connection.c
++++ b/fs/smb/server/connection.c
+@@ -291,6 +291,8 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
+ 		conn->um = NULL;
+ 	INIT_WORK(&conn->release_work, __ksmbd_conn_release_work);
+ 	atomic_set(&conn->req_running, 0);
++	atomic_set(&conn->write_processing, 0);
++	atomic_set(&conn->write_rx_pending, 0);
+ 	atomic_set(&conn->r_count, 0);
+ 	atomic_set(&conn->refcnt, 1);
+ 	conn->total_credits = 1;
+@@ -801,6 +803,9 @@ int ksmbd_conn_handler_loop(void *p)
+ 		size = t->ops->read(t, hdr_buf, sizeof(hdr_buf), -1);
+ 		if (size != sizeof(hdr_buf))
+ 			break;
++		if (READ_ONCE(ksmbd_write_wq_enabled) && ksmbd_write_wq_adaptive)
++			conn->write_rx_overlap =
++				atomic_read(&conn->write_processing) > 0;
+ 
+ 		pdu_size = get_rfc1002_len(hdr_buf);
+ 		ksmbd_debug(CONN, "RFC1002 header %u bytes\n", pdu_size);
+diff --git a/fs/smb/server/connection.h b/fs/smb/server/connection.h
+index fc8d81e58f0b..6432e4f125e4 100644
+--- a/fs/smb/server/connection.h
++++ b/fs/smb/server/connection.h
+@@ -69,6 +69,11 @@ struct ksmbd_conn {
+ 	bool				write_wq_blocked;
+ 	/* Sticky across channel removal; accessed with READ/WRITE_ONCE. */
+ 	bool				multichannel_seen;
++	/* Queued or processing eligible WRITEs, excluding response sending. */
++	atomic_t			write_processing;
++	/* Workers publish unread TCP data; only RX changes placement. */
++	atomic_t			write_rx_pending;
++	bool				write_rx_overlap;
+ 	int				status;
+ 	unsigned int			cli_cap;
+ 	bool				stop_called;
+diff --git a/fs/smb/server/ksmbd_work.c b/fs/smb/server/ksmbd_work.c
+index e1e150b09d8d..1c543921843c 100644
+--- a/fs/smb/server/ksmbd_work.c
++++ b/fs/smb/server/ksmbd_work.c
+@@ -52,6 +52,12 @@ MODULE_PARM_DESC(write_wq,
+ 
+ static struct workqueue_struct *ksmbd_write_wq;
+ 
++/* Load-time experiment, effective only when write_wq is enabled. */
++bool ksmbd_write_wq_adaptive;
++module_param_named(write_wq_adaptive, ksmbd_write_wq_adaptive, bool, 0444);
++MODULE_PARM_DESC(write_wq_adaptive,
++		 "Experimental per-connection placement for write_wq; load-time only");
++
+ void ksmbd_requeue_write_tx(struct ksmbd_conn *conn)
+ {
+ 	WARN_ON_ONCE(!queue_work(ksmbd_write_wq, &conn->write_tx_work));
+@@ -61,6 +67,19 @@ void ksmbd_requeue_write_tx(struct ksmbd_conn *conn)
+ bool ksmbd_queue_request(struct ksmbd_work *work, bool use_write_wq)
+ {
+ 	struct workqueue_struct *wq = ksmbd_wq;
++	struct ksmbd_conn *conn = work->conn;
++
++	if (use_write_wq && ksmbd_write_wq_adaptive) {
++		bool overlap, pending;
++
++		overlap = conn->write_rx_overlap ||
++			atomic_read(&conn->write_processing) > 0;
++		pending = atomic_read(&conn->write_rx_pending) &&
++			atomic_xchg(&conn->write_rx_pending, 0);
++		use_write_wq = overlap || pending;
++		work->write_processing = true;
++		atomic_inc(&conn->write_processing);
++	}
+ 
+ 	work->batch_write_response = use_write_wq;
+ 	if (use_write_wq)
+diff --git a/fs/smb/server/ksmbd_work.h b/fs/smb/server/ksmbd_work.h
+index 920b9e297ae8..0b538164fb28 100644
+--- a/fs/smb/server/ksmbd_work.h
++++ b/fs/smb/server/ksmbd_work.h
+@@ -127,6 +127,7 @@ struct ksmbd_work {
+ 	__le16				request_open_chseq;
+ 
+ 	bool				batch_write_response;
++	bool				write_processing;
+ 	struct list_head		write_tx_entry;
+ 	struct work_struct              work;
+ 	/* List head at conn->requests */
+@@ -182,6 +183,7 @@ void ksmbd_workqueue_destroy(void);
+ bool ksmbd_queue_work(struct ksmbd_work *work);
+ extern bool ksmbd_write_wq_enabled;
+ int ksmbd_configure_write_wq(bool enabled);
++extern bool ksmbd_write_wq_adaptive;
+ bool ksmbd_queue_request(struct ksmbd_work *work, bool use_write_wq);
+ int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
+ 			   struct aux_read *ar, unsigned int aux_size);
+diff --git a/fs/smb/server/server.c b/fs/smb/server/server.c
+index ba66a924a1b6..be7080d20416 100644
+--- a/fs/smb/server/server.c
++++ b/fs/smb/server/server.c
+@@ -180,6 +180,19 @@ static int __process_request(struct ksmbd_work *work, struct ksmbd_conn *conn,
+ 	return SERVER_HANDLER_CONTINUE;
+ }
+ 
++static void ksmbd_write_processing_done(struct ksmbd_work *work)
++{
++	if (!work->write_processing)
++		return;
++	work->write_processing = false;
++	/* RX may not run until processing ends; retain unread TCP data as a hint. */
++	if (!work->batch_write_response &&
++	    ksmbd_tcp_rx_ready(work->conn->transport))
++		atomic_set(&work->conn->write_rx_pending, 1);
++	/* Complete accounting before the response can reach the client. */
++	WARN_ON_ONCE(atomic_dec_return(&work->conn->write_processing) < 0);
++}
++
+ static bool __handle_ksmbd_work(struct ksmbd_work *work,
+ 				struct ksmbd_conn *conn)
+ {
+@@ -352,6 +365,7 @@ static bool __handle_ksmbd_work(struct ksmbd_work *work,
+ 		ksmbd_user_session_put(work->sess);
+ 
+ 	smb2_set_read_splice(work);
++	ksmbd_write_processing_done(work);
+ 	if (work->batch_write_response) {
+ 		enum ksmbd_tx_result result;
+ 
+@@ -367,6 +381,8 @@ void ksmbd_finish_work(struct ksmbd_work *work)
+ {
+ 	struct ksmbd_conn *conn = work->conn;
+ 
++	/* Allocation and transform failures can bypass response preparation. */
++	ksmbd_write_processing_done(work);
+ 	ksmbd_conn_try_dequeue_request(work);
+ 	ksmbd_free_work_struct(work);
+ 	ksmbd_conn_r_count_dec(conn);
+diff --git a/fs/smb/server/transport_tcp.c b/fs/smb/server/transport_tcp.c
+index 19cd1731836e..0a4328285f50 100644
+--- a/fs/smb/server/transport_tcp.c
++++ b/fs/smb/server/transport_tcp.c
+@@ -51,6 +51,12 @@ static void ksmbd_tcp_disconnect(struct ksmbd_transport *t);
+ #define TCP_TRANS(t)	((struct tcp_transport *)container_of(t, \
+ 				struct tcp_transport, transport))
+ 
++/* Advisory only. A request reference keeps the transport/socket alive. */
++bool ksmbd_tcp_rx_ready(struct ksmbd_transport *t)
++{
++	return tcp_epollin_ready(TCP_TRANS(t)->sock->sk, 1);
++}
++
+ static inline void ksmbd_tcp_nodelay(struct socket *sock)
+ {
+ 	tcp_sock_set_nodelay(sock->sk);
+diff --git a/fs/smb/server/transport_tcp.h b/fs/smb/server/transport_tcp.h
+index 4095854ee91d..d466fa4d8b4e 100644
+--- a/fs/smb/server/transport_tcp.h
++++ b/fs/smb/server/transport_tcp.h
+@@ -10,6 +10,7 @@ int ksmbd_tcp_set_interfaces(char *ifc_list, int ifc_list_sz);
+ struct interface *ksmbd_find_netdev_name_iface_list(char *netdev_name);
+ void ksmbd_free_transport(struct ksmbd_transport *kt);
+ bool ksmbd_transport_is_tcp(struct ksmbd_transport *t);
++bool ksmbd_tcp_rx_ready(struct ksmbd_transport *t);
+ int ksmbd_tcp_init(void);
+ void ksmbd_tcp_destroy(void);
+ 

@@ -1,0 +1,63 @@
+From 630e1a07cae63a3b28c955d1d9f166a6c0de3628 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 3 Nov 2026 16:50:45 +0800
+Subject: [RFC PATCH v2 0/8] ksmbd: improve READ sends and WRITE execution
+
+This series reduces TCP READ payload copies and routes eligible WRITEs to
+a CPU-scoped, non-strict unbound workqueue. Completed WRITE responses are
+coalesced without waiting to fill a batch.
+
+The last two patches are separate, default-off experiments: per-connection
+placement based on observed WRITE overlap, and sending completed WRITE
+responses from the TCP receiver. The startup WRITE policy also requires
+companion ksmbd-tools support.
+
+The latest short comparison used tmpfs, 1 MiB single-channel WRITEs,
+libaio/direct=0/cache=none, on a 128-CPU server with a local 4-vCPU client.
+Server CPUs used schedutil except client host CPUs16-23, which retained
+performance in every arm. Two paired rounds used 15s warmup, 2s ramp and
+30s measurement, without tracing. READ splice was off in all three arms.
+
+Throughput (MiB/s):
+
+ jobs  QD   PERCPU   Adaptive/worker TX   Adaptive/RX TX   RX/PERCPU
+    1   2  2792.07             2587.08          3081.68     +10.37%
+   16  32  2181.93             3364.07          3793.72     +73.90%
+
+Percentages are medians of within-round changes. All arms used the same
+module/core; PERCPU is the disabled-optimization path, not a separately
+built historical stock kernel. QD2 P99 improved by 41.27% over PERCPU;
+high-concurrency P99 did not consistently improve over worker-owned TX.
+
+Bounded invalid-session response tests covered FIN, paused reads/resume
+and RST cleanup. RX-owned sending can still block on TCP send backpressure;
+nonblocking send coordination remains open. These short tests do not yet
+establish behavior across mixed traffic, multiple channels and low QDs.
+
+Huiwen He (8):
+  workqueue: export attribute and sysfs setup helpers
+  ksmbd: route WRITE requests to an unbound workqueue
+  ksmbd: complete TCP frames before reporting send success
+  ksmbd: send READ payloads with MSG_SPLICE_PAGES
+  ksmbd: coalesce completed WRITE responses
+  ksmbd: accept WRITE workqueue policy from startup configuration
+  ksmbd: experiment with per-connection WRITE placement
+  ksmbd: experiment with RX-owned WRITE response sending
+
+ fs/smb/server/connection.c    | 207 ++++++++++++++++++++++
+ fs/smb/server/connection.h    |  26 +++
+ fs/smb/server/ksmbd_netlink.h |   2 +
+ fs/smb/server/ksmbd_work.c    | 321 +++++++++++++++++++++++++++++++---
+ fs/smb/server/ksmbd_work.h    |  31 ++++
+ fs/smb/server/server.c        | 136 ++++++++++++--
+ fs/smb/server/smb2pdu.c       | 141 ++++++++++++---
+ fs/smb/server/smb2pdu.h       |   1 +
+ fs/smb/server/transport_tcp.c |  99 ++++++++++-
+ fs/smb/server/transport_tcp.h |   3 +
+ fs/smb/server/vfs.c           |  37 +++-
+ fs/smb/server/vfs.h           |   2 +
+ kernel/workqueue.c            |   4 +
+ 13 files changed, 947 insertions(+), 63 deletions(-)
+
+
+base-commit: e1253a82bb4c0fed6706a5839fc8b6e01be1abe2
