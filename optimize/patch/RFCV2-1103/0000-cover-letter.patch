@@ -1,4 +1,4 @@
-From 630e1a07cae63a3b28c955d1d9f166a6c0de3628 Mon Sep 17 00:00:00 2001
+From f9f11d925490f58c5cb7e1794d1f8fe474c8e902 Mon Sep 17 00:00:00 2001
 From: Huiwen He <hehuiwen@kylinos.cn>
 Date: Tue, 3 Nov 2026 16:50:45 +0800
 Subject: [RFC PATCH v2 0/8] ksmbd: improve READ sends and WRITE execution
@@ -12,7 +12,8 @@ placement based on observed WRITE overlap, and sending completed WRITE
 responses from the TCP receiver. The startup WRITE policy also requires
 companion ksmbd-tools support.
 
-The latest short comparison used tmpfs, 1 MiB single-channel WRITEs,
+The earlier RX-owner prototype was tested on tmpfs with 1 MiB
+single-channel WRITEs,
 libaio/direct=0/cache=none, on a 128-CPU server with a local 4-vCPU client.
 Server CPUs used schedutil except client host CPUs16-23, which retained
 performance in every arm. Two paired rounds used 15s warmup, 2s ramp and
@@ -29,10 +30,11 @@ module/core; PERCPU is the disabled-optimization path, not a separately
 built historical stock kernel. QD2 P99 improved by 41.27% over PERCPU;
 high-concurrency P99 did not consistently improve over worker-owned TX.
 
-Bounded invalid-session response tests covered FIN, paused reads/resume
-and RST cleanup. RX-owned sending can still block on TCP send backpressure;
-nonblocking send coordination remains open. These short tests do not yet
-establish behavior across mixed traffic, multiple channels and low QDs.
+RX now uses nonblocking sends and delegates partial batches to a TX
+worker, retaining frame serialization and a single owner-release path.
+Invalid-session transport tests passed FIN, paused-reader recovery, mixed
+replies, reset and shutdown. Throughput has not been retested after these
+changes; the table above describes the earlier prototype.
 
 Huiwen He (8):
   workqueue: export attribute and sysfs setup helpers
@@ -44,20 +46,20 @@ Huiwen He (8):
   ksmbd: experiment with per-connection WRITE placement
   ksmbd: experiment with RX-owned WRITE response sending
 
- fs/smb/server/connection.c    | 207 ++++++++++++++++++++++
- fs/smb/server/connection.h    |  26 +++
+ fs/smb/server/connection.c    | 329 ++++++++++++++++++++++++++++++++++++-
+ fs/smb/server/connection.h    |  32 ++++
  fs/smb/server/ksmbd_netlink.h |   2 +
- fs/smb/server/ksmbd_work.c    | 321 +++++++++++++++++++++++++++++++---
+ fs/smb/server/ksmbd_work.c    | 321 +++++++++++++++++++++++++++++++++---
  fs/smb/server/ksmbd_work.h    |  31 ++++
- fs/smb/server/server.c        | 136 ++++++++++++--
- fs/smb/server/smb2pdu.c       | 141 ++++++++++++---
+ fs/smb/server/server.c        | 136 +++++++++++++--
+ fs/smb/server/smb2pdu.c       | 141 +++++++++++++---
  fs/smb/server/smb2pdu.h       |   1 +
- fs/smb/server/transport_tcp.c |  99 ++++++++++-
- fs/smb/server/transport_tcp.h |   3 +
- fs/smb/server/vfs.c           |  37 +++-
+ fs/smb/server/transport_tcp.c | 114 ++++++++++++-
+ fs/smb/server/transport_tcp.h |   7 +
+ fs/smb/server/vfs.c           |  37 ++++-
  fs/smb/server/vfs.h           |   2 +
  kernel/workqueue.c            |   4 +
- 13 files changed, 947 insertions(+), 63 deletions(-)
+ 13 files changed, 1093 insertions(+), 64 deletions(-)
 
 
 base-commit: e1253a82bb4c0fed6706a5839fc8b6e01be1abe2
