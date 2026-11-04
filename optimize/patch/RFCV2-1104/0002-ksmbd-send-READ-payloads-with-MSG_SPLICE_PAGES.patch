@@ -1,0 +1,870 @@
+From df6b2b2342b1d795689e22fef59a8966dafd8e4c Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 2 Nov 2026 10:46:17 +0800
+Subject: [RFC PATCH v2 2/8] ksmbd: send READ payloads with MSG_SPLICE_PAGES
+
+TCP copies READ payloads after the filesystem has filled the response
+buffer.
+
+Read eligible responses into refcounted pages and send them with bvec
+iterators and MSG_SPLICE_PAGES. Try a whole-response allocation without
+reclaim, then fall back to small folios or base pages. Retain copying for
+allocation or layout failures and short reads that would pin an oversized
+folio.
+
+Validated the module build, short READs, allocation failure fallback and
+page lifetime. Short fio comparisons covered 64KiB/1MiB READs with 1/4
+channels.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/connection.c    |   8 ++
+ fs/smb/server/connection.h    |   4 +
+ fs/smb/server/ksmbd_work.c    | 186 +++++++++++++++++++++++++++++-----
+ fs/smb/server/ksmbd_work.h    |  12 +++
+ fs/smb/server/server.c        |   1 +
+ fs/smb/server/smb2pdu.c       | 135 ++++++++++++++++++++----
+ fs/smb/server/smb2pdu.h       |   1 +
+ fs/smb/server/transport_tcp.c |  59 ++++++++++-
+ fs/smb/server/transport_tcp.h |   1 +
+ fs/smb/server/vfs.c           |  37 ++++++-
+ fs/smb/server/vfs.h           |   2 +
+ 11 files changed, 391 insertions(+), 55 deletions(-)
+
+diff --git a/fs/smb/server/connection.c b/fs/smb/server/connection.c
+index 4cb92d6599ee..fe690fe912a0 100644
+--- a/fs/smb/server/connection.c
++++ b/fs/smb/server/connection.c
+@@ -518,6 +518,14 @@ static int __ksmbd_conn_write(struct ksmbd_work *work,
+ 	tx->iov = work->iov;
+ 	tx->iov_cnt = work->iov_cnt;
+ 	tx->size = get_rfc1002_len(work->iov[0].iov_base) + 4;
++	tx->splice_header_len = work->splice_header_len;
++	if (tx->splice_header_len) {
++		struct aux_read *ar;
++
++		ar = list_first_entry(&work->aux_read_list, struct aux_read, entry);
++		tx->bvec = ar->bvec;
++		tx->nr_bvec = ar->nr_bvec + 1;
++	}
+ 	tx->need_invalidate_rkey = work->need_invalidate_rkey;
+ 	tx->remote_key = work->remote_key;
+ 
+diff --git a/fs/smb/server/connection.h b/fs/smb/server/connection.h
+index 63484c8efbbd..9948e84b7dcc 100644
+--- a/fs/smb/server/connection.h
++++ b/fs/smb/server/connection.h
+@@ -162,6 +162,10 @@ struct ksmbd_transport_write {
+ 	struct kvec	*iov;
+ 	int		iov_cnt;
+ 	int		size;
++	/* bvec[0] is reserved for the prefix copied into a page fragment. */
++	struct bio_vec	*bvec;
++	unsigned int	nr_bvec;
++	unsigned int	splice_header_len;
+ 	bool		need_invalidate_rkey;
+ 	unsigned int	remote_key;
+ 	int		msg_flags;
+diff --git a/fs/smb/server/ksmbd_work.c b/fs/smb/server/ksmbd_work.c
+index d307aefe0aec..133a567f4c5f 100644
+--- a/fs/smb/server/ksmbd_work.c
++++ b/fs/smb/server/ksmbd_work.c
+@@ -17,6 +17,128 @@
+ static struct kmem_cache *work_cache;
+ static struct workqueue_struct *ksmbd_wq;
+ 
++static bool ksmbd_alloc_read_pages(struct aux_read *ar, size_t length)
++{
++	gfp_t gfp = GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN;
++	unsigned int nr_pages = DIV_ROUND_UP(length, PAGE_SIZE);
++	unsigned int order = PAGE_FRAG_CACHE_MAX_ORDER;
++	unsigned int whole_order = get_order(length);
++	unsigned int i;
++
++	ar->bvec = kvcalloc(nr_pages + 1, sizeof(*ar->bvec), gfp);
++	if (!ar->bvec)
++		return false;
++
++	/* Try one allocation without reclaim, then fall back to small pages. */
++	if (whole_order > order && whole_order <= MAX_PAGE_ORDER) {
++		struct page *page;
++
++		page = alloc_pages((gfp & ~__GFP_RECLAIM) | __GFP_COMP,
++				   whole_order);
++		if (page) {
++			bvec_set_page(&ar->bvec[1], page, length, 0);
++			ar->nr_bvec = 1;
++			return true;
++		}
++	}
++
++	/*
++	 * Each bvec owns one small allocation. Larger folios are optional:
++	 * do not reclaim for them, and use base pages after the first failure.
++	 */
++	while (length) {
++		struct page *page;
++		size_t len;
++
++		while (order && length < (PAGE_SIZE << order))
++			order--;
++		page = alloc_pages((order ? gfp & ~__GFP_DIRECT_RECLAIM : gfp) |
++				   __GFP_COMP, order);
++		if (!page) {
++			if (order) {
++				order = 0;
++				continue;
++			}
++			goto free_pages;
++		}
++
++		len = min_t(size_t, length, PAGE_SIZE << order);
++		bvec_set_page(&ar->bvec[++ar->nr_bvec], page, len, 0);
++		length -= len;
++	}
++	return true;
++
++free_pages:
++	for (i = 1; i <= ar->nr_bvec; i++)
++		put_page(ar->bvec[i].bv_page);
++	ar->nr_bvec = 0;
++	kvfree(ar->bvec);
++	ar->bvec = NULL;
++	return false;
++}
++
++struct aux_read *ksmbd_alloc_read_buf(size_t length, bool allow_splice)
++{
++	struct aux_read *ar;
++	size_t alloc_size = ALIGN(length, 8);
++
++	ar = kzalloc_obj(*ar, KSMBD_DEFAULT_GFP);
++	if (!ar)
++		return NULL;
++
++	if (allow_splice && length && ksmbd_alloc_read_pages(ar, length))
++		return ar;
++	ar->buf = kvmalloc(alloc_size, KSMBD_DEFAULT_GFP);
++	if (!ar->buf) {
++		kfree(ar);
++		return NULL;
++	}
++	return ar;
++}
++
++/* Drop unused pages after a short READ and initialize any alignment padding. */
++void ksmbd_read_buf_set_size(struct aux_read *ar, size_t size)
++{
++	void *tail = ar->buf;
++	unsigned int nr_bvec = 0, i;
++	size_t tail_size = size;
++
++	if (ar->bvec) {
++		for (i = 1; i <= ar->nr_bvec; i++) {
++			struct bio_vec *bv = &ar->bvec[i];
++
++			if (!size) {
++				put_page(bv->bv_page);
++				continue;
++			}
++			bv->bv_len = min_t(size_t, size, bv->bv_len);
++			size -= bv->bv_len;
++			nr_bvec++;
++			tail_size = bv->bv_len;
++			tail = page_address(bv->bv_page);
++		}
++		ar->nr_bvec = nr_bvec;
++		if (!nr_bvec)
++			return;
++	}
++	if (tail_size & 7)
++		memset(tail + tail_size, 0, ALIGN(tail_size, 8) - tail_size);
++}
++
++void ksmbd_free_read_buf(struct aux_read *ar)
++{
++	unsigned int i;
++
++	if (!ar)
++		return;
++	/* TCP may still own references; never reuse or modify these pages. */
++	for (i = 0; i < ar->nr_bvec; i++)
++		put_page(ar->bvec[i + 1].bv_page);
++	kvfree(ar->bvec);
++	kvfree(ar->buf);
++	kfree(ar);
++}
++
+ static int ksmbd_reserve_iov(struct ksmbd_work *work, int need_iov_cnt)
+ {
+ 	struct kvec *new;
+@@ -30,14 +152,14 @@ static int ksmbd_reserve_iov(struct ksmbd_work *work, int need_iov_cnt)
+ 	} while (new_alloc_cnt < work->iov_cnt + need_iov_cnt);
+ 
+ 	if (work->iov == work->iov_inline) {
+-		new = kzalloc_objs(*new, new_alloc_cnt, KSMBD_DEFAULT_GFP);
++		new = kvcalloc(new_alloc_cnt, sizeof(*new), KSMBD_DEFAULT_GFP);
+ 		if (!new)
+ 			return -ENOMEM;
+ 
+ 		memcpy(new, work->iov_inline, sizeof(work->iov_inline));
+ 	} else {
+-		new = krealloc(work->iov, sizeof(*new) * new_alloc_cnt,
+-			       KSMBD_DEFAULT_GFP | __GFP_ZERO);
++		new = kvrealloc(work->iov, sizeof(*new) * new_alloc_cnt,
++				KSMBD_DEFAULT_GFP | __GFP_ZERO);
+ 		if (!new)
+ 			return -ENOMEM;
+ 	}
+@@ -74,16 +196,15 @@ void ksmbd_free_work_struct(struct ksmbd_work *work)
+ 	kvfree(work->response_buf);
+ 
+ 	list_for_each_entry_safe(ar, tmp, &work->aux_read_list, entry) {
+-		kvfree(ar->buf);
+ 		list_del(&ar->entry);
+-		kfree(ar);
++		ksmbd_free_read_buf(ar);
+ 	}
+ 
+ 	kfree(work->tr_buf);
+ 	kvfree(work->compress_buf);
+ 	kvfree(work->request_buf);
+ 	if (work->iov != work->iov_inline)
+-		kfree(work->iov);
++		kvfree(work->iov);
+ 
+ 	if (work->async_id)
+ 		ksmbd_release_id(&work->conn->async_ida, work->async_id);
+@@ -135,23 +256,20 @@ static inline void __ksmbd_iov_pin(struct ksmbd_work *work, void *ib,
+ 	work->iov_cnt++;
+ }
+ 
+-static int __ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len,
+-			       void *aux_buf, unsigned int aux_size)
++/* On success, work owns ar, including a buffer with no response payload. */
++int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
++			   struct aux_read *ar, unsigned int aux_size)
+ {
+-	struct aux_read *ar = NULL;
+ 	int need_iov_cnt = 1;
++	unsigned int i;
+ 
+-	if (aux_size) {
++	if (aux_size)
++		need_iov_cnt += ar->bvec ? ar->nr_bvec : 1;
++	if (!work->iov_idx)
+ 		need_iov_cnt++;
+-		ar = kmalloc_obj(struct aux_read, KSMBD_DEFAULT_GFP);
+-		if (!ar)
+-			return -ENOMEM;
+-	}
+ 
+-	if (ksmbd_reserve_iov(work, need_iov_cnt)) {
+-		kfree(ar);
++	if (ksmbd_reserve_iov(work, need_iov_cnt))
+ 		return -ENOMEM;
+-	}
+ 
+ 	/* Plus rfc_length size on first iov */
+ 	if (!work->iov_idx) {
+@@ -165,25 +283,45 @@ static int __ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len,
+ 	inc_rfc1001_len(work->iov[0].iov_base, len);
+ 
+ 	if (aux_size) {
+-		__ksmbd_iov_pin(work, aux_buf, aux_size);
++		if (ar->bvec) {
++			for (i = 0; i < ar->nr_bvec; i++) {
++				const struct bio_vec *bv = &ar->bvec[i + 1];
++
++				__ksmbd_iov_pin(work, page_address(bv->bv_page),
++						bv->bv_len);
++			}
++		} else {
++			__ksmbd_iov_pin(work, ar->buf, aux_size);
++		}
+ 		inc_rfc1001_len(work->iov[0].iov_base, aux_size);
+-
+-		ar->buf = aux_buf;
+-		list_add(&ar->entry, &work->aux_read_list);
+ 	}
++	if (ar)
++		list_add(&ar->entry, &work->aux_read_list);
+ 
+ 	return 0;
+ }
+ 
+ int ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len)
+ {
+-	return __ksmbd_iov_pin_rsp(work, ib, len, NULL, 0);
++	return ksmbd_iov_pin_rsp_read(work, ib, len, NULL, 0);
+ }
+ 
+-int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
++int ksmbd_iov_pin_rsp_data(struct ksmbd_work *work, void *ib, int len,
+ 			   void *aux_buf, unsigned int aux_size)
+ {
+-	return __ksmbd_iov_pin_rsp(work, ib, len, aux_buf, aux_size);
++	struct aux_read *ar;
++	int ret;
++
++	if (!aux_size)
++		return ksmbd_iov_pin_rsp(work, ib, len);
++	ar = kzalloc_obj(*ar, KSMBD_DEFAULT_GFP);
++	if (!ar)
++		return -ENOMEM;
++	ar->buf = aux_buf;
++	ret = ksmbd_iov_pin_rsp_read(work, ib, len, ar, aux_size);
++	if (ret)
++		kfree(ar); /* The caller still owns aux_buf. */
++	return ret;
+ }
+ 
+ int allocate_interim_rsp_buf(struct ksmbd_work *work)
+diff --git a/fs/smb/server/ksmbd_work.h b/fs/smb/server/ksmbd_work.h
+index 0844aa929f55..b6c446954699 100644
+--- a/fs/smb/server/ksmbd_work.h
++++ b/fs/smb/server/ksmbd_work.h
+@@ -7,12 +7,14 @@
+ #define __KSMBD_WORK_H__
+ 
+ #include <linux/ctype.h>
++#include <linux/bvec.h>
+ #include <linux/workqueue.h>
+ 
+ struct ksmbd_conn;
+ struct ksmbd_session;
+ struct ksmbd_tree_connect;
+ struct ksmbd_file;
++struct page;
+ 
+ #define KSMBD_WORK_INLINE_IOVS	4
+ 
+@@ -24,6 +26,9 @@ enum {
+ 
+ struct aux_read {
+ 	void *buf;
++	/* One owned folio per payload bvec; bvec[0] is for the TCP header. */
++	struct bio_vec *bvec;
++	unsigned int nr_bvec;
+ 	struct list_head entry;
+ };
+ 
+@@ -45,6 +50,8 @@ struct ksmbd_work {
+ 	int				iov_alloc_cnt;
+ 	int				iov_cnt;
+ 	int				iov_idx;
++	/* Final response prefix before page-backed payload iovs; zero disables splice. */
++	unsigned int		splice_header_len;
+ 	struct kvec			iov_inline[KSMBD_WORK_INLINE_IOVS];
+ 
+ 	/* Next cmd hdr in compound req buf*/
+@@ -149,6 +156,9 @@ static inline void *ksmbd_req_buf_next(struct ksmbd_work *work)
+ 
+ struct ksmbd_work *ksmbd_alloc_work_struct(void);
+ void ksmbd_free_work_struct(struct ksmbd_work *work);
++struct aux_read *ksmbd_alloc_read_buf(size_t length, bool allow_splice);
++void ksmbd_read_buf_set_size(struct aux_read *ar, size_t size);
++void ksmbd_free_read_buf(struct aux_read *ar);
+ 
+ void ksmbd_work_pool_destroy(void);
+ int ksmbd_work_pool_init(void);
+@@ -157,6 +167,8 @@ int ksmbd_workqueue_init(void);
+ void ksmbd_workqueue_destroy(void);
+ bool ksmbd_queue_work(struct ksmbd_work *work);
+ int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
++			   struct aux_read *ar, unsigned int aux_size);
++int ksmbd_iov_pin_rsp_data(struct ksmbd_work *work, void *ib, int len,
+ 			   void *aux_buf, unsigned int aux_size);
+ int ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len);
+ int allocate_interim_rsp_buf(struct ksmbd_work *work);
+diff --git a/fs/smb/server/server.c b/fs/smb/server/server.c
+index 0069d4e6a60a..30ae31295283 100644
+--- a/fs/smb/server/server.c
++++ b/fs/smb/server/server.c
+@@ -349,6 +349,7 @@ static void __handle_ksmbd_work(struct ksmbd_work *work,
+ 	if (work->sess)
+ 		ksmbd_user_session_put(work->sess);
+ 
++	smb2_set_read_splice(work);
+ 	ksmbd_conn_write(work);
+ }
+ 
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index b7ce67094626..65b54aada28d 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -14,6 +14,8 @@
+ #include <linux/ethtool.h>
+ #include <linux/falloc.h>
+ #include <linux/mount.h>
++#include <linux/mm.h>
++#include <linux/module.h>
+ #include <linux/filelock.h>
+ #include <linux/fileattr.h>
+ #include <linux/timekeeping.h>
+@@ -47,6 +49,29 @@
+ #include "transport_tcp.h"
+ #include "compress.h"
+ 
++/* Switching affects allocation, not ownership of existing READ buffers. */
++static bool read_splice;
++
++static int read_splice_set(const char *val, const struct kernel_param *kp)
++{
++	bool enabled;
++	int ret;
++
++	ret = kstrtobool(val ?: "1", &enabled);
++	if (!ret)
++		WRITE_ONCE(*(bool *)kp->arg, enabled);
++	return ret;
++}
++
++static const struct kernel_param_ops read_splice_ops = {
++	.flags = KERNEL_PARAM_OPS_FL_NOARG,
++	.set = read_splice_set,
++	.get = param_get_bool,
++};
++module_param_cb(read_splice, &read_splice_ops, &read_splice, 0644);
++__MODULE_PARM_TYPE(read_splice, "bool");
++MODULE_PARM_DESC(read_splice, "Page-backed ordinary TCP READ sends");
++
+ static void __wbuf(struct ksmbd_work *work, void **req, void **rsp)
+ {
+ 	if (work->next_smb2_rcv_hdr_off) {
+@@ -7694,9 +7719,9 @@ static int smb2_get_info_sec(struct ksmbd_work *work,
+ 	if (rc)
+ 		goto err_out;
+ 
+-	rc = ksmbd_iov_pin_rsp_read(work, (void *)rsp,
+-			offsetof(struct smb2_query_info_rsp, Buffer),
+-			pntsd, secdesclen);
++	rc = ksmbd_iov_pin_rsp_data(work, (void *)rsp,
++				    offsetof(struct smb2_query_info_rsp, Buffer),
++				    pntsd, secdesclen);
+ err_out:
+ 	if (rc) {
+ 		rsp->OutputBufferLength = 0;
+@@ -8678,7 +8703,7 @@ static noinline int smb2_read_pipe(struct ksmbd_work *work)
+ 			       rpc_resp->payload_sz);
+ 
+ 		nbytes = rpc_resp->payload_sz;
+-		err = ksmbd_iov_pin_rsp_read(work, (void *)rsp,
++		err = ksmbd_iov_pin_rsp_data(work, (void *)rsp,
+ 					     offsetof(struct smb2_read_rsp, Buffer),
+ 					     aux_payload_buf, nbytes);
+ 		if (err) {
+@@ -8998,6 +9023,69 @@ static ssize_t smb2_read_rdma(struct ksmbd_work *work,
+ 	return length;
+ }
+ 
++void smb2_set_read_splice(struct ksmbd_work *work)
++{
++	const unsigned int prefix_len = sizeof(__be32);
++	const unsigned int rsp_len = offsetof(struct smb2_read_rsp, Buffer);
++	const unsigned int header_len = prefix_len + rsp_len;
++	const struct smb2_read_rsp *rsp;
++	const struct aux_read *ar;
++	unsigned int payload_len = 0, i;
++
++	work->splice_header_len = 0;
++	if (!list_is_singular(&work->aux_read_list))
++		return;
++	ar = list_first_entry(&work->aux_read_list, struct aux_read, entry);
++	/* Only eligible TCP READs allocate a page-backed auxiliary buffer. */
++	if (!ar->bvec || !ar->nr_bvec)
++		return;
++
++	/* The final response must still be RFC1002 length + READ header + data. */
++	if (work->iov_cnt != ar->nr_bvec + 2 ||
++	    work->iov[0].iov_len != prefix_len ||
++	    work->iov[1].iov_len != rsp_len)
++		return;
++	rsp = work->iov[1].iov_base;
++
++	/* Signing follows the READ handler; session/tcon refs may be gone. */
++	if (rsp->hdr.Flags & SMB2_FLAGS_SIGNED)
++		return;
++
++	/* Keep the copy fallback and bvec views of the payload identical. */
++	for (i = 0; i < ar->nr_bvec; i++) {
++		const struct bio_vec *bv = &ar->bvec[i + 1];
++		const struct kvec *iov = &work->iov[i + 2];
++
++		if (iov->iov_base != page_address(bv->bv_page) ||
++		    iov->iov_len != bv->bv_len)
++			return;
++		/* Do not let a short READ pin a mostly unused allocation in TCP. */
++		if (get_order(bv->bv_len) < compound_order(bv->bv_page))
++			return;
++		payload_len += bv->bv_len;
++	}
++	if (le32_to_cpu(rsp->DataLength) != payload_len ||
++	    get_rfc1002_len(work->iov[0].iov_base) + prefix_len !=
++					payload_len + header_len)
++		return;
++
++	work->splice_header_len = header_len;
++}
++
++static bool smb2_read_splice_eligible(struct ksmbd_work *work,
++				      const struct smb2_read_req *req)
++{
++	/* Negotiated signing/encryption capabilities alone do not exclude READs. */
++	return READ_ONCE(read_splice) &&
++		!work->next_smb2_rcv_hdr_off && !req->hdr.NextCommand &&
++		!work->encrypted &&
++		!work->sess->sign && !work->conn->sign &&
++		!(req->hdr.Flags & SMB2_FLAGS_SIGNED) &&
++		!(req->Flags & SMB2_READFLAG_REQUEST_COMPRESSED) &&
++		req->Channel == SMB2_CHANNEL_NONE &&
++		ksmbd_transport_is_tcp(work->conn->transport);
++}
++
+ /**
+  * smb2_read() - handler for smb2 read from file
+  * @work:	smb work containing read command buffer
+@@ -9007,6 +9095,7 @@ static ssize_t smb2_read_rdma(struct ksmbd_work *work,
+ int smb2_read(struct ksmbd_work *work)
+ {
+ 	struct ksmbd_conn *conn = work->conn;
++	struct aux_read *ar = NULL;
+ 	struct smb2_read_req *req;
+ 	struct smb2_read_rsp *rsp;
+ 	struct ksmbd_file *fp = NULL;
+@@ -9018,7 +9107,6 @@ int smb2_read(struct ksmbd_work *work)
+ 	bool is_rdma_channel = false, async_interim = false;
+ 	unsigned int max_read_size = conn->vals->max_read_size;
+ 	unsigned int id = KSMBD_NO_FID, pid = KSMBD_NO_FID;
+-	void *aux_payload_buf;
+ 
+ 	ksmbd_debug(SMB, "Received smb2 read request\n");
+ 
+@@ -9131,15 +9219,22 @@ int smb2_read(struct ksmbd_work *work)
+ 	ksmbd_debug(SMB, "filename %pD, offset %lld, len %zu\n",
+ 		    fp->filp, offset, length);
+ 
+-	aux_payload_buf = kvmalloc(ALIGN(length, 8), KSMBD_DEFAULT_GFP);
+-	if (!aux_payload_buf) {
++	ar = ksmbd_alloc_read_buf(length, !ksmbd_stream_fd(fp) &&
++				  smb2_read_splice_eligible(work, req));
++	if (!ar) {
+ 		err = -ENOMEM;
+ 		goto out;
+ 	}
+ 
+-	nbytes = ksmbd_vfs_read(work, fp, length, &offset, aux_payload_buf);
++	if (ar->bvec) {
++		struct iov_iter to;
++
++		iov_iter_bvec(&to, ITER_DEST, ar->bvec + 1, ar->nr_bvec, length);
++		nbytes = ksmbd_vfs_read_iter(work, fp, &offset, &to);
++	} else {
++		nbytes = ksmbd_vfs_read(work, fp, length, &offset, ar->buf);
++	}
+ 	if (nbytes < 0) {
+-		kvfree(aux_payload_buf);
+ 		err = nbytes;
+ 		goto out;
+ 	}
+@@ -9150,11 +9245,10 @@ int smb2_read(struct ksmbd_work *work)
+ 	 * alignment padding, leaking uninitialized kernel memory to the
+ 	 * client.  Zero just that tail.
+ 	 */
+-	if (nbytes & 7)
+-		memset(aux_payload_buf + nbytes, 0, ALIGN(nbytes, 8) - nbytes);
++	ksmbd_read_buf_set_size(ar, nbytes);
+ 
+ 	if ((nbytes == 0 && length != 0) || nbytes < mincount) {
+-		kvfree(aux_payload_buf);
++		ksmbd_free_read_buf(ar);
+ 		rsp->hdr.Status = STATUS_END_OF_FILE;
+ 		smb2_set_err_rsp(work);
+ 		if (async_interim)
+@@ -9169,16 +9263,15 @@ int smb2_read(struct ksmbd_work *work)
+ 	if (is_rdma_channel == true) {
+ 		rdma_transform_len = smb2_prep_rdma_read(work, req,
+ 							 rsp,
+-							 aux_payload_buf,
++							 ar->buf,
+ 							 nbytes);
+ 		if (rdma_transform_len < 0) {
+-			kvfree(aux_payload_buf);
+ 			err = rdma_transform_len;
+ 			goto out;
+ 		}
+ 		/* write data to the client using rdma channel */
+ 		remain_bytes = smb2_read_rdma(work, req,
+-					      aux_payload_buf,
++					      ar->buf,
+ 					      nbytes);
+ 		if (remain_bytes < 0)
+ 			pr_err("RDMA READ transfer failed: session=%llu payload=%zu transform=%d rc=%zd\n",
+@@ -9189,8 +9282,8 @@ int smb2_read(struct ksmbd_work *work)
+ 				    "RDMA READ transfer completed: session=%llu payload=%zu transform=%d\n",
+ 				    work->sess ? work->sess->id : 0, nbytes,
+ 				    rdma_transform_len);
+-		kvfree(aux_payload_buf);
+-		aux_payload_buf = NULL;
++		ksmbd_free_read_buf(ar);
++		ar = NULL;
+ 		nbytes = 0;
+ 		if (remain_bytes < 0) {
+ 			err = (int)remain_bytes;
+@@ -9208,11 +9301,10 @@ int smb2_read(struct ksmbd_work *work)
+ 	err = ksmbd_iov_pin_rsp_read(work, (void *)rsp,
+ 				     offsetof(struct smb2_read_rsp, Buffer) +
+ 				     rdma_transform_len,
+-				     aux_payload_buf, nbytes);
+-	if (err) {
+-		kvfree(aux_payload_buf);
++				     ar, nbytes);
++	if (err)
+ 		goto out;
+-	}
++	ar = NULL; /* The response now owns the buffer. */
+ 	if (async_interim)
+ 		release_async_work(work);
+ 	/*
+@@ -9228,6 +9320,7 @@ int smb2_read(struct ksmbd_work *work)
+ 	return 0;
+ 
+ out:
++	ksmbd_free_read_buf(ar);
+ 	if (async_interim)
+ 		release_async_work(work);
+ 	if (err) {
+diff --git a/fs/smb/server/smb2pdu.h b/fs/smb/server/smb2pdu.h
+index 3f08d1ca5a38..27e60f9ff4db 100644
+--- a/fs/smb/server/smb2pdu.h
++++ b/fs/smb/server/smb2pdu.h
+@@ -429,6 +429,7 @@ bool smb3_encryption_negotiated(struct ksmbd_conn *conn);
+ /* smb2 misc functions */
+ int ksmbd_smb2_check_message(struct ksmbd_work *work);
+ void smb2_complete_request_open(struct ksmbd_work *work);
++void smb2_set_read_splice(struct ksmbd_work *work);
+ 
+ /* smb2 command handlers */
+ int smb2_handle_negotiate(struct ksmbd_work *work);
+diff --git a/fs/smb/server/transport_tcp.c b/fs/smb/server/transport_tcp.c
+index 25d039ad9627..19cd1731836e 100644
+--- a/fs/smb/server/transport_tcp.c
++++ b/fs/smb/server/transport_tcp.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include <linux/freezer.h>
++#include <linux/bvec.h>
++#include <linux/page_frag_cache.h>
+ 
+ #include "smb_common.h"
+ #include "server.h"
+@@ -32,6 +34,8 @@ static int bind_additional_ifaces;
+ struct tcp_transport {
+ 	struct ksmbd_transport		transport;
+ 	struct socket			*sock;
++	/* Serialized by conn->srv_mutex. */
++	struct page_frag_cache		tx_frag_cache;
+ 	struct kvec			*iov;
+ 	unsigned int			nr_iov;
+ };
+@@ -66,6 +70,7 @@ static struct tcp_transport *alloc_transport(struct socket *client_sk)
+ 	if (!t)
+ 		return NULL;
+ 	t->sock = client_sk;
++	page_frag_cache_init(&t->tx_frag_cache);
+ 
+ 	conn = ksmbd_conn_alloc();
+ 	if (!conn) {
+@@ -100,6 +105,7 @@ static void ksmbd_tcp_free_transport(struct ksmbd_transport *kt)
+ 	struct tcp_transport *t = TCP_TRANS(kt);
+ 
+ 	sock_release(t->sock);
++	page_frag_cache_drain(&t->tx_frag_cache);
+ 	kfree(t->iov);
+ 	kfree(t);
+ }
+@@ -431,6 +437,31 @@ static int ksmbd_tcp_read(struct ksmbd_transport *t, char *buf,
+ 	return ksmbd_tcp_readv(TCP_TRANS(t), &iov, 1, to_read, max_retries);
+ }
+ 
++/* The payload pages are ready; prepend the final header in bvec[0]. */
++static void *ksmbd_tcp_build_splice_header(struct tcp_transport *t,
++					   const struct ksmbd_transport_write *tx)
++{
++	unsigned int header_len = tx->splice_header_len;
++	struct iov_iter iter;
++	void *header_frag;
++
++	if (!header_len || header_len > PAGE_SIZE || header_len >= tx->size ||
++	    !tx->bvec || tx->nr_bvec < 2)
++		return NULL;
++
++	header_frag = page_frag_alloc(&t->tx_frag_cache, header_len,
++				      GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
++	if (!header_frag)
++		return NULL;
++	iov_iter_kvec(&iter, ITER_SOURCE, tx->iov, tx->iov_cnt, header_len);
++	if (!copy_from_iter_full(header_frag, header_len, &iter)) {
++		page_frag_free(header_frag);
++		return NULL;
++	}
++	bvec_set_virt(&tx->bvec[0], header_frag, header_len);
++	return header_frag;
++}
++
+ static int ksmbd_tcp_writev(struct ksmbd_transport *t,
+ 			    const struct ksmbd_transport_write *tx)
+ {
+@@ -438,21 +469,34 @@ static int ksmbd_tcp_writev(struct ksmbd_transport *t,
+ 		.msg_flags = MSG_NOSIGNAL | tx->msg_flags,
+ 	};
+ 	struct socket *sock = TCP_TRANS(t)->sock;
++	void *header_frag;
+ 	int ret;
+ 
+-	iov_iter_kvec(&smb_msg.msg_iter, ITER_SOURCE, tx->iov,
+-		      tx->iov_cnt, tx->size);
+-	/* The caller holds srv_mutex across the entire frame. */
++	/* The caller holds srv_mutex across preparation and the entire frame. */
++	header_frag = ksmbd_tcp_build_splice_header(TCP_TRANS(t), tx);
++	if (header_frag) {
++		iov_iter_bvec(&smb_msg.msg_iter, ITER_SOURCE, tx->bvec,
++			      tx->nr_bvec, tx->size);
++		smb_msg.msg_flags |= MSG_SPLICE_PAGES;
++	} else {
++		iov_iter_kvec(&smb_msg.msg_iter, ITER_SOURCE, tx->iov,
++			      tx->iov_cnt, tx->size);
++	}
+ 	while (iov_iter_count(&smb_msg.msg_iter)) {
+ 		ret = sock_sendmsg(sock, &smb_msg);
+ 		if (ret <= 0) {
+ 			/* Never append another SMB frame to an incomplete one. */
+ 			kernel_sock_shutdown(sock, SHUT_RDWR);
+-			return ret ?: -EIO;
++			ret = ret ?: -EIO;
++			goto out;
+ 		}
+ 	}
+ 
+-	return tx->size;
++	ret = tx->size;
++out:
++	if (header_frag)
++		page_frag_free(header_frag);
++	return ret;
+ }
+ 
+ static void ksmbd_tcp_disconnect(struct ksmbd_transport *t)
+@@ -732,3 +776,8 @@ static const struct ksmbd_transport_ops ksmbd_tcp_transport_ops = {
+ 	.shutdown	= ksmbd_tcp_shutdown,
+ 	.free_transport = ksmbd_tcp_free_transport,
+ };
++
++bool ksmbd_transport_is_tcp(struct ksmbd_transport *t)
++{
++	return t->ops == &ksmbd_tcp_transport_ops;
++}
+diff --git a/fs/smb/server/transport_tcp.h b/fs/smb/server/transport_tcp.h
+index 1e51675ee1b2..4095854ee91d 100644
+--- a/fs/smb/server/transport_tcp.h
++++ b/fs/smb/server/transport_tcp.h
+@@ -9,6 +9,7 @@
+ int ksmbd_tcp_set_interfaces(char *ifc_list, int ifc_list_sz);
+ struct interface *ksmbd_find_netdev_name_iface_list(char *netdev_name);
+ void ksmbd_free_transport(struct ksmbd_transport *kt);
++bool ksmbd_transport_is_tcp(struct ksmbd_transport *t);
+ int ksmbd_tcp_init(void);
+ void ksmbd_tcp_destroy(void);
+ 
+diff --git a/fs/smb/server/vfs.c b/fs/smb/server/vfs.c
+index c2c9aaa5de1b..dd4045af3981 100644
+--- a/fs/smb/server/vfs.c
++++ b/fs/smb/server/vfs.c
+@@ -328,17 +328,19 @@ static int check_lock_range(struct file *filp, loff_t start, loff_t end,
+ }
+ 
+ /**
+- * ksmbd_vfs_read() - vfs helper for smb file read
++ * __ksmbd_vfs_read() - vfs helper for smb file read
+  * @work:	smb work
+  * @fp:		ksmbd file pointer
+  * @count:	read byte count
+  * @pos:	file pos
+  * @rbuf:	read data buffer
++ * @to:		optional destination iterator instead of @rbuf
+  *
+  * Return:	number of read bytes on success, otherwise error
+  */
+-int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
+-		   loff_t *pos, char *rbuf)
++static int __ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp,
++			    size_t count, loff_t *pos, char *rbuf,
++			    struct iov_iter *to)
+ {
+ 	struct file *filp = fp->filp;
+ 	ssize_t nbytes = 0;
+@@ -357,8 +359,11 @@ int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
+ 		}
+ 	}
+ 
+-	if (ksmbd_stream_fd(fp))
++	if (ksmbd_stream_fd(fp)) {
++		if (to)
++			return -EINVAL;
+ 		return ksmbd_vfs_stream_read(fp, rbuf, pos, count);
++	}
+ 
+ 	if (!work->tcon->posix_extensions) {
+ 		int ret;
+@@ -370,7 +375,17 @@ int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
+ 		}
+ 	}
+ 
+-	nbytes = kernel_read(filp, rbuf, count, pos);
++	if (to) {
++		/* Match kernel_read(): do not mix legacy read and read_iter. */
++		if (unlikely(filp->f_op->read))
++			return -EINVAL;
++		nbytes = vfs_iter_read(filp, to, pos, 0);
++		if (nbytes > 0)
++			add_rchar(current, nbytes);
++		inc_syscr(current);
++	} else {
++		nbytes = kernel_read(filp, rbuf, count, pos);
++	}
+ 	if (nbytes < 0) {
+ 		pr_err("smb read failed, err = %zd\n", nbytes);
+ 		return nbytes;
+@@ -381,6 +396,18 @@ int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
+ 	return nbytes;
+ }
+ 
++int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
++		   loff_t *pos, char *rbuf)
++{
++	return __ksmbd_vfs_read(work, fp, count, pos, rbuf, NULL);
++}
++
++int ksmbd_vfs_read_iter(struct ksmbd_work *work, struct ksmbd_file *fp,
++			loff_t *pos, struct iov_iter *to)
++{
++	return __ksmbd_vfs_read(work, fp, iov_iter_count(to), pos, NULL, to);
++}
++
+ static int ksmbd_vfs_stream_write(struct ksmbd_file *fp, char *buf, loff_t *pos,
+ 				  size_t count)
+ {
+diff --git a/fs/smb/server/vfs.h b/fs/smb/server/vfs.h
+index 55d099de71f5..a1200ebfc475 100644
+--- a/fs/smb/server/vfs.h
++++ b/fs/smb/server/vfs.h
+@@ -80,6 +80,8 @@ int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode);
+ int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode);
+ int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
+ 		   loff_t *pos, char *rbuf);
++int ksmbd_vfs_read_iter(struct ksmbd_work *work, struct ksmbd_file *fp,
++			loff_t *pos, struct iov_iter *to);
+ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 		    char *buf, size_t count, loff_t *pos, bool sync,
+ 		    ssize_t *written);

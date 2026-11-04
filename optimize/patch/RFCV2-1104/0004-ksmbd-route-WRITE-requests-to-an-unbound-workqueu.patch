@@ -1,0 +1,266 @@
+From 699630d3241e0142e3c0371f99e15331a962b262 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Mon, 2 Nov 2026 10:46:17 +0800
+Subject: [RFC PATCH v2 4/8] ksmbd: route WRITE requests to an unbound
+ workqueue
+
+WRITE requests from one connection can accumulate on a busy per-CPU
+pool even when other CPUs are available.
+
+Route eligible single-channel WRITEs to a CPU-scoped, non-strict
+unbound queue. Keep other requests per-CPU; READ and unclassified
+traffic keep subsequent WRITEs there until the connection becomes idle.
+Retain per-CPU placement once the session has used multiple channels.
+
+Keep write_wq disabled by default: unbound execution can improve
+concurrent WRITE throughput but can regress small or serial WRITEs.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/connection.h |  4 ++
+ fs/smb/server/ksmbd_work.c | 53 ++++++++++++++++++++++++++
+ fs/smb/server/ksmbd_work.h |  2 +
+ fs/smb/server/server.c     | 77 +++++++++++++++++++++++++++++++++++++-
+ fs/smb/server/smb2pdu.c    |  6 +++
+ 5 files changed, 141 insertions(+), 1 deletion(-)
+
+diff --git a/fs/smb/server/connection.h b/fs/smb/server/connection.h
+index 9948e84b7dcc..8a482e16c878 100644
+--- a/fs/smb/server/connection.h
++++ b/fs/smb/server/connection.h
+@@ -59,6 +59,10 @@ struct ksmbd_conn {
+ 	struct smb_version_cmds		*cmds;
+ 	unsigned int			max_cmds;
+ 	struct mutex			srv_mutex;
++	/* RX-only: keep WRITEs per-CPU until idle is observed. */
++	bool				write_wq_blocked;
++	/* Sticky across channel removal; accessed with READ/WRITE_ONCE. */
++	bool				multichannel_seen;
+ 	int				status;
+ 	unsigned int			cli_cap;
+ 	bool				stop_called;
+diff --git a/fs/smb/server/ksmbd_work.c b/fs/smb/server/ksmbd_work.c
+index 133a567f4c5f..132439dfbd09 100644
+--- a/fs/smb/server/ksmbd_work.c
++++ b/fs/smb/server/ksmbd_work.c
+@@ -7,6 +7,7 @@
+ #include <linux/mm.h>
+ #include <linux/slab.h>
+ #include <linux/workqueue.h>
++#include <linux/module.h>
+ 
+ #include "server.h"
+ #include "connection.h"
+@@ -17,6 +18,23 @@
+ static struct kmem_cache *work_cache;
+ static struct workqueue_struct *ksmbd_wq;
+ 
++/* Load-time switch for the WRITE request routing policy. */
++bool ksmbd_write_wq_enabled;
++module_param_named(write_wq, ksmbd_write_wq_enabled, bool, 0444);
++MODULE_PARM_DESC(write_wq,
++		 "Route eligible WRITEs to an unbound workqueue; load-time only");
++
++static struct workqueue_struct *ksmbd_write_wq;
++
++/* Only the sole receiver calls this for newly admitted requests. */
++bool ksmbd_queue_request(struct ksmbd_work *work, bool use_write_wq)
++{
++	struct workqueue_struct *wq = use_write_wq ? ksmbd_write_wq : ksmbd_wq;
++
++	/* No work/conn access after publication: the consumer may free both. */
++	return queue_work(wq, &work->work);
++}
++
+ static bool ksmbd_alloc_read_pages(struct aux_read *ar, size_t length)
+ {
+ 	gfp_t gfp = GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN;
+@@ -231,14 +249,49 @@ int ksmbd_work_pool_init(void)
+ 
+ int ksmbd_workqueue_init(void)
+ {
++	struct workqueue_attrs *attrs;
++	int ret = -ENOMEM;
++
+ 	ksmbd_wq = alloc_workqueue("ksmbd-io", WQ_PERCPU, 0);
+ 	if (!ksmbd_wq)
+ 		return -ENOMEM;
++	if (!ksmbd_write_wq_enabled)
++		return 0;
++
++	ksmbd_write_wq = alloc_workqueue("ksmbd-write", WQ_UNBOUND, 0);
++	if (!ksmbd_write_wq)
++		goto destroy_io_wq;
++	attrs = alloc_workqueue_attrs();
++	if (!attrs)
++		goto destroy_write_wq;
++	attrs->affn_scope = WQ_AFFN_CPU;
++	attrs->affn_strict = false;
++	ret = apply_workqueue_attrs(ksmbd_write_wq, attrs);
++	free_workqueue_attrs(attrs);
++	if (ret)
++		goto destroy_write_wq;
++
++	/* Set the initial policy before exposing writable sysfs attributes. */
++	ret = workqueue_sysfs_register(ksmbd_write_wq);
++	if (ret)
++		goto destroy_write_wq;
+ 	return 0;
++
++destroy_write_wq:
++	destroy_workqueue(ksmbd_write_wq);
++	ksmbd_write_wq = NULL;
++destroy_io_wq:
++	destroy_workqueue(ksmbd_wq);
++	ksmbd_wq = NULL;
++	return ret;
+ }
+ 
+ void ksmbd_workqueue_destroy(void)
+ {
++	if (ksmbd_write_wq) {
++		destroy_workqueue(ksmbd_write_wq);
++		ksmbd_write_wq = NULL;
++	}
+ 	destroy_workqueue(ksmbd_wq);
+ 	ksmbd_wq = NULL;
+ }
+diff --git a/fs/smb/server/ksmbd_work.h b/fs/smb/server/ksmbd_work.h
+index b6c446954699..a66e660c8c32 100644
+--- a/fs/smb/server/ksmbd_work.h
++++ b/fs/smb/server/ksmbd_work.h
+@@ -166,6 +166,8 @@ int ksmbd_work_pool_init(void);
+ int ksmbd_workqueue_init(void);
+ void ksmbd_workqueue_destroy(void);
+ bool ksmbd_queue_work(struct ksmbd_work *work);
++extern bool ksmbd_write_wq_enabled;
++bool ksmbd_queue_request(struct ksmbd_work *work, bool use_write_wq);
+ int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
+ 			   struct aux_read *ar, unsigned int aux_size);
+ int ksmbd_iov_pin_rsp_data(struct ksmbd_work *work, void *ib, int len,
+diff --git a/fs/smb/server/server.c b/fs/smb/server/server.c
+index 30ae31295283..70cad4e0e8e2 100644
+--- a/fs/smb/server/server.c
++++ b/fs/smb/server/server.c
+@@ -12,6 +12,7 @@
+ #include <linux/sysfs.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
++#include <linux/unaligned.h>
+ 
+ #include "server.h"
+ #include "smb_common.h"
+@@ -19,6 +20,7 @@
+ #include "../common/smb2status.h"
+ #include "connection.h"
+ #include "transport_ipc.h"
++#include "transport_tcp.h"
+ #include "mgmt/user_session.h"
+ #include "crypto_ctx.h"
+ #include "auth.h"
+@@ -373,6 +375,79 @@ static void handle_ksmbd_work(struct work_struct *wk)
+ 	ksmbd_conn_r_count_dec(conn);
+ }
+ 
++enum ksmbd_wq_class {
++	KSMBD_WQ_LOCAL,
++	KSMBD_WQ_WRITE,
++	KSMBD_WQ_BLOCK_WRITE,
++};
++
++/*
++ * Classify a complete RFC1002-framed request for workqueue placement only.
++ * Check bounds before inspecting fields; leave protocol validation to the worker.
++ */
++static enum ksmbd_wq_class ksmbd_smb2_wq_classify(void *buf)
++{
++	const struct smb2_hdr *hdr = smb_get_msg(buf);
++	const struct smb2_write_req *req = (const void *)hdr;
++	unsigned int len = get_rfc1002_len(buf);
++
++	if (len < sizeof(*hdr) || hdr->ProtocolId != SMB2_PROTO_NUMBER ||
++	    hdr->NextCommand ||
++	    (hdr->Flags & (SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND |
++			   SMB2_FLAGS_RELATED_OPERATIONS | SMB2_FLAGS_SIGNED)))
++		return KSMBD_WQ_BLOCK_WRITE;
++
++	switch (get_unaligned_le16(&hdr->Command)) {
++	case SMB2_WRITE_HE:
++		if (len < sizeof(*req) || !req->Length ||
++		    req->Channel != SMB2_CHANNEL_NONE || req->Flags)
++			return KSMBD_WQ_BLOCK_WRITE;
++		return KSMBD_WQ_WRITE;
++	case SMB2_NEGOTIATE_HE:
++	case SMB2_SESSION_SETUP_HE:
++	case SMB2_LOGOFF_HE:
++	case SMB2_TREE_CONNECT_HE:
++	case SMB2_TREE_DISCONNECT_HE:
++	case SMB2_CREATE_HE:
++	case SMB2_CLOSE_HE:
++	case SMB2_FLUSH_HE:
++	case SMB2_CANCEL_HE:
++	case SMB2_ECHO_HE:
++	case SMB2_QUERY_INFO_HE:
++	case SMB2_SET_INFO_HE:
++		/* Keep these commands per-CPU without blocking the WRITE queue. */
++		return KSMBD_WQ_LOCAL;
++	default:
++		/* READ and unclassified traffic also keep later WRITEs per-CPU. */
++		return KSMBD_WQ_BLOCK_WRITE;
++	}
++}
++
++/*
++ * RX-only placement policy. The current request already holds r_count.
++ * READ or unclassified traffic keeps later WRITEs per-CPU until RX
++ * observes r_count == 1. This does not drain or move work already queued.
++ * Extra oplock/notify references can delay rearming, never hasten it.
++ */
++static bool ksmbd_use_write_wq(struct ksmbd_work *work)
++{
++	struct ksmbd_conn *conn = work->conn;
++	enum ksmbd_wq_class wq_class = KSMBD_WQ_BLOCK_WRITE;
++
++	if (!ksmbd_write_wq_enabled)
++		return false;
++
++	if (ksmbd_transport_is_tcp(conn->transport))
++		wq_class = ksmbd_smb2_wq_classify(work->request_buf);
++	if (wq_class == KSMBD_WQ_BLOCK_WRITE)
++		conn->write_wq_blocked = true;
++	else if (conn->write_wq_blocked && atomic_read(&conn->r_count) == 1)
++		conn->write_wq_blocked = false;
++
++	return wq_class == KSMBD_WQ_WRITE && !conn->write_wq_blocked &&
++		!READ_ONCE(conn->multichannel_seen);
++}
++
+ /**
+  * queue_ksmbd_work() - queue a smb request to worker thread queue
+  *		for processing smb command and sending response
+@@ -404,7 +479,7 @@ static int queue_ksmbd_work(struct ksmbd_conn *conn)
+ 	/* update activity on connection */
+ 	conn->last_active = jiffies;
+ 	INIT_WORK(&work->work, handle_ksmbd_work);
+-	ksmbd_queue_work(work);
++	ksmbd_queue_request(work, ksmbd_use_write_wq(work));
+ 	return 0;
+ }
+ 
+diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
+index 65b54aada28d..4561bc7cf171 100644
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -150,6 +150,12 @@ static int register_session_channel(struct ksmbd_session *sess,
+ 	if (xa_is_err(old)) {
+ 		kfree_sensitive(chann);
+ 		rc = xa_err(old);
++		goto out;
++	}
++	if (ksmbd_write_wq_enabled && count) {
++		/* Remember the extra channel even if binding later fails. */
++		xa_for_each(&sess->ksmbd_chann_list, index, chann)
++			WRITE_ONCE(chann->conn->multichannel_seen, true);
+ 	}
+ out:
+ 	up_write(&sess->chann_lock);

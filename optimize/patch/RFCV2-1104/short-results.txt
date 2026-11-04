@@ -1,0 +1,43 @@
+RX single-frame simplification, 2026-11-04
+
+Baseline: dev_ksmbd 997db9441583. Candidate changes connection.c/.h only.
+Tested binary SHA256: 9f92bafe6cd4d45fd520674c20f9336337bb41aad135ae6d06df6548952ca775
+The exact tested candidate is now in the working tree. Existing commits unchanged.
+
+One-channel WRITE, tmpfs, server schedutil; host CPUs16-23 hosting client in performance; natural RX placement unchanged. 15s warmup +2s ramp +30s measured; no profiling. READ splice off. All valid samples retained.
+
+Original RX merging -> single-frame RX, no persistent merge buffer:
+Block jobs/QD pairs merged_MiB/s single_MiB/s median_paired_% [min,max]
+4K    16/32   5     224.89     218.38   +0.82% [-24.69,+11.98]
+1M    16/32   2    3905.42    3942.88   +0.97% [-1.01,+2.96]
+1M    1/ 2   2    3080.40    3121.06   +1.32% [+0.92,+1.71]
+
+4K pairs in chronological order:
+initial r1: 236.38 -> 178.01 MiB/s, -24.69%, P99 +34.04%
+initial r2: 224.89 -> 228.65 MiB/s, +1.67%, P99 -3.87%
+4k-recheck r1: 220.12 -> 217.60 MiB/s, -1.14%, P99 -3.77%
+4k-recheck r2: 195.02 -> 218.38 MiB/s, +11.98%, P99 -16.75%
+4k-recheck r3: 232.87 -> 234.77 MiB/s, +0.82%, P99 +4.32%
+
+Keep as a reviewed experiment in the working tree, do not rewrite the eight commits yet. 1M performance preserved in this screen. Initial 4K -24.69% did not repeat in the three added pairs; cause unresolved, not classified as harmless noise. Do not expand the test matrix or add policy heuristics based on this screen.
+
+Safety: 10 kernel cases passed, including FIN, paused reader/resume, interleaved direct replies, RST and service stop/unload. Real short sends and EAGAIN observed. Source-extracted ASan/UBSan tests:18 cases per version. Before/after restoration checked exactly.
+
+Simplification: remove 1248-byte per-connection RX batch allocation and copying into its iov; add 40-byte conn iterator and retain one pending work. Existing conn member offsets unchanged. Worker mode still merges responses. Shared drain/owner lifecycle unchanged. Net diff:32 insertions,35 deletions.
+
+Limitations:
+Two initial pairs for each scenario, plus three 4K pairs; no broad non-regression claim.
+Host-wide TCPTimeouts increased in four timed samples; counted SMB sockets reported zero retransmitted bytes/OFO, sampled host receive-prune/collapse/drop counters zero. No network warning samples excluded.
+Kernel transport stress uses invalid-session SMB replies to exercise backpressure/ownership; it does not establish filesystem/CANCEL correctness.
+W=1 built successfully; existing worker-batch stack frame warning remains (1296 bytes, previously1328).
+No code-change attribution for the initial 4K outlier.
+
+Artifacts:
+initial: results/performance/{summary.md,evaluation.json,rows.json}
+recheck: recheck4k/results/performance/{summary.md,evaluation.json,rows.json}
+safety: results/safety; safety-frame-validation.json
+candidate: simplify.patch; connection.c/.h; source-hashes.json
+identities: source-identity-validation.json; working-tree-validation.json
+raw archives: server-results.tar.gz; recheck4k/server-results.tar.gz
+
+Next decision: review this RX simplification as part of patch8. Keep worker-only batching as patch6 while it remains a selectable mode. Do not label the continuation workqueue a separate throughput optimization. No long matrix launched.

@@ -1,0 +1,63 @@
+From 52c65a2cc0bad8d31b061cb2df199a94acb8e502 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Wed, 4 Nov 2026 18:05:13 +0800
+Subject: [RFC PATCH v2 0/8] ksmbd: improve READ sends and WRITE execution
+
+This series reduces TCP READ payload copies and routes eligible WRITEs to
+a CPU-scoped, non-strict unbound workqueue. Worker-owned WRITE responses
+can be coalesced without waiting to fill a batch.
+
+The last two patches are separate, default-off experiments: placement
+based on observed WRITE overlap, and sending completed WRITE responses
+from the receiver. RX now sends individual frames using the existing
+work iov; incomplete sends are continued by a TX worker. Startup WRITE
+policy requires companion ksmbd-tools support.
+
+A short comparison against the previous RX-coalescing implementation used
+1-channel WRITEs, tmpfs, libaio/direct=0/cache=none, on a 128-CPU server
+with a local 4-vCPU client. The server used schedutil; client host CPUs
+16-23 used performance in both arms. Samples used 15s warmup, 2s ramp and
+30s measurement without tracing. READ splice was off; adaptive WRITE
+placement and RX sending were on in both arms.
+
+Throughput (MiB/s); changes are medians of paired changes:
+
+ size  jobs  QD  pairs  RX coalescing  RX single-frame  change
+   4K    16  32      5         224.89           218.38  +0.82%
+   1M     1   2      2        3080.40          3121.06  +1.32%
+   1M    16  32      2        3905.42          3942.88  +0.97%
+
+One initial 4 KiB pair dropped 24.69%; three further pairs did not
+reproduce it. All samples are retained and its cause is unresolved.
+The adaptive on/off comparison on this revision is still pending.
+
+Kernel transport checks covered FIN, paused-reader recovery, interleaved
+replies, reset, shutdown and short-send continuation.
+
+Huiwen He (8):
+  ksmbd: complete TCP frames before reporting send success
+  ksmbd: send READ payloads with MSG_SPLICE_PAGES
+  workqueue: export attribute and sysfs setup helpers
+  ksmbd: route WRITE requests to an unbound workqueue
+  ksmbd: accept WRITE workqueue policy from startup configuration
+  ksmbd: coalesce completed WRITE responses
+  ksmbd: experiment with per-connection WRITE placement
+  ksmbd: experiment with RX-owned WRITE response sending
+
+ fs/smb/server/connection.c    | 323 +++++++++++++++++++++++++++++++++-
+ fs/smb/server/connection.h    |  39 ++++
+ fs/smb/server/ksmbd_netlink.h |   2 +
+ fs/smb/server/ksmbd_work.c    | 321 ++++++++++++++++++++++++++++++---
+ fs/smb/server/ksmbd_work.h    |  31 ++++
+ fs/smb/server/server.c        | 136 ++++++++++++--
+ fs/smb/server/smb2pdu.c       | 141 ++++++++++++---
+ fs/smb/server/smb2pdu.h       |   1 +
+ fs/smb/server/transport_tcp.c | 128 +++++++++++++-
+ fs/smb/server/transport_tcp.h |   7 +
+ fs/smb/server/vfs.c           |  37 +++-
+ fs/smb/server/vfs.h           |   2 +
+ kernel/workqueue.c            |   4 +
+ 13 files changed, 1108 insertions(+), 64 deletions(-)
+
+
+base-commit: e1253a82bb4c0fed6706a5839fc8b6e01be1abe2

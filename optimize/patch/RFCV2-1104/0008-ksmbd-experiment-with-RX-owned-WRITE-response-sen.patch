@@ -1,0 +1,595 @@
+From 52c65a2cc0bad8d31b061cb2df199a94acb8e502 Mon Sep 17 00:00:00 2001
+From: Huiwen He <hehuiwen@kylinos.cn>
+Date: Tue, 3 Nov 2026 16:32:23 +0800
+Subject: [RFC PATCH v2 8/8] ksmbd: experiment with RX-owned WRITE response
+ sending
+
+WRITE workers can contend with the receiver on the same TCP socket.
+Let the receiver send completed WRITE responses, controlled by the
+default-off write_tx_rx_owner parameter.
+
+Send one frame at a time from its existing iov. Use nonblocking sends
+in RX and retain the work and iterator for TX-worker continuation.
+Track ownership with a locked IDLE/DRAINING/DEFERRED state and keep one
+owner reference until draining finishes. Notify RX when ownership starts
+or returns from the continuation.
+
+Drain before TCP receives and while waiting for request slots. Preserve
+frame serialization, the response budget and receive-attempt deadlines.
+Worker-owned response coalescing remains unchanged.
+
+Built with W=1. Extracted-function ASan/UBSan and kernel transport checks
+passed, including FIN, paused readers, mixed replies, reset, shutdown
+and short-send recovery. Short fio comparisons preserved 1 MiB WRITE
+throughput. One 4 KiB slowdown did not repeat in three further pairs;
+its cause remains unresolved.
+
+Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+---
+ fs/smb/server/connection.c    | 248 ++++++++++++++++++++++++++++------
+ fs/smb/server/connection.h    |  22 ++-
+ fs/smb/server/transport_tcp.c |  58 +++++++-
+ fs/smb/server/transport_tcp.h |   5 +
+ 4 files changed, 290 insertions(+), 43 deletions(-)
+
+diff --git a/fs/smb/server/connection.c b/fs/smb/server/connection.c
+index c1eaaf42ebab..16ca5e072ab4 100644
+--- a/fs/smb/server/connection.c
++++ b/fs/smb/server/connection.c
+@@ -21,6 +21,11 @@
+ 
+ static DEFINE_MUTEX(init_lock);
+ 
++static bool write_tx_rx_owner;
++module_param(write_tx_rx_owner, bool, 0444);
++MODULE_PARM_DESC(write_tx_rx_owner,
++		 "Experiment: drain completed WRITE responses in the TCP receiver");
++
+ static struct ksmbd_conn_ops default_conn_ops;
+ 
+ DEFINE_HASHTABLE(conn_list, CONN_HASH_BITS);
+@@ -157,6 +162,7 @@ static void delete_proc_clients(void) {}
+ #endif
+ 
+ static struct workqueue_struct *ksmbd_conn_wq;
++static struct workqueue_struct *ksmbd_tx_wq;
+ 
+ int ksmbd_conn_wq_init(void)
+ {
+@@ -164,11 +170,24 @@ int ksmbd_conn_wq_init(void)
+ 					WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+ 	if (!ksmbd_conn_wq)
+ 		return -ENOMEM;
++	if (write_tx_rx_owner) {
++		/* Send waiters must not consume the continuation's active slots. */
++		ksmbd_tx_wq = alloc_workqueue("ksmbd-tx", WQ_UNBOUND, 0);
++		if (!ksmbd_tx_wq) {
++			destroy_workqueue(ksmbd_conn_wq);
++			ksmbd_conn_wq = NULL;
++			return -ENOMEM;
++		}
++	}
+ 	return 0;
+ }
+ 
+ void ksmbd_conn_wq_destroy(void)
+ {
++	if (ksmbd_tx_wq) {
++		destroy_workqueue(ksmbd_tx_wq);
++		ksmbd_tx_wq = NULL;
++	}
+ 	if (ksmbd_conn_wq) {
+ 		destroy_workqueue(ksmbd_conn_wq);
+ 		ksmbd_conn_wq = NULL;
+@@ -506,6 +525,14 @@ int ksmbd_conn_wait_idle_sess(struct ksmbd_conn *curr_conn,
+ #define KSMBD_WRITE_TX_FRAME_SIZE 256
+ #define KSMBD_WRITE_TX_BUDGET 64
+ 
++/* Temporary storage for worker-owned response coalescing. */
++struct ksmbd_write_tx_batch {
++	struct kvec iov[KSMBD_WRITE_TX_FRAMES * KSMBD_WRITE_TX_IOVS];
++	struct ksmbd_work *frames[KSMBD_WRITE_TX_FRAMES];
++	struct ksmbd_transport_write tx;
++	unsigned int nr;
++};
++
+ static bool ksmbd_write_tx_eligible(struct ksmbd_work *work)
+ {
+ 	size_t size, total = 0;
+@@ -529,82 +556,174 @@ static bool ksmbd_write_tx_eligible(struct ksmbd_work *work)
+ 	return total == size;
+ }
+ 
++static void ksmbd_release_write_batch(struct ksmbd_write_tx_batch *batch,
++				      struct ksmbd_work *inline_work)
++{
++	unsigned int i;
++
++	for (i = 0; i < batch->nr; i++) {
++		/* Its original callback releases the inline owner's own work. */
++		if (batch->frames[i] != inline_work)
++			ksmbd_finish_work(batch->frames[i]);
++	}
++	batch->nr = 0;
++}
++
++static void ksmbd_wake_rx_tx(struct ksmbd_conn *conn)
++{
++	ksmbd_tcp_wake_rx(conn->transport);
++	wake_up_all(&conn->req_running_q);
++	wake_up_all(&conn->r_count_q);
++}
++
++static void ksmbd_write_tx_error(struct ksmbd_conn *conn, int error)
++{
++	pr_err("Failed to send WRITE responses: %d\n", error);
++	spin_lock(&conn->write_tx_lock);
++	conn->write_tx_failed = true;
++	spin_unlock(&conn->write_tx_lock);
++}
++
++/* False defers this frame to the TX worker; RX retains the owner reference. */
++static bool ksmbd_try_send_rx_tx(struct ksmbd_conn *conn,
++				 struct ksmbd_work *work)
++{
++	bool locked;
++	int ret;
++
++	iov_iter_kvec(&conn->write_tx_iter, ITER_SOURCE, work->iov,
++		      work->iov_cnt, get_rfc1002_len(work->iov[0].iov_base) + 4);
++	locked = mutex_trylock(&conn->srv_mutex);
++	if (locked) {
++		ret = ksmbd_tcp_send_iter(conn->transport, &conn->write_tx_iter,
++					  MSG_DONTWAIT);
++		if (ret <= 0 && ret != -EAGAIN) {
++			conn->transport->ops->shutdown(conn->transport);
++			ksmbd_write_tx_error(conn, ret ?: -EIO);
++		} else if (iov_iter_count(&conn->write_tx_iter)) {
++			goto defer;
++		}
++		ksmbd_conn_unlock(conn);
++		return true;
++	}
++defer:
++	/* The queued work owns the iov until the continuation finishes it. */
++	conn->write_tx_pending = work;
++	/* Reserve a partial frame before releasing its serialization lock. */
++	spin_lock(&conn->write_tx_lock);
++	WRITE_ONCE(conn->write_tx_state, KSMBD_WRITE_TX_DEFERRED);
++	spin_unlock(&conn->write_tx_lock);
++	if (locked)
++		ksmbd_conn_unlock(conn);
++	WARN_ON_ONCE(!queue_work(ksmbd_tx_wq, &conn->write_tx_work));
++	return false;
++}
++
+ static void ksmbd_drain_write_tx(struct ksmbd_conn *conn,
+ 				 struct ksmbd_work *inline_work)
+ {
+-	struct kvec iov[KSMBD_WRITE_TX_FRAMES * KSMBD_WRITE_TX_IOVS];
+-	struct ksmbd_work *frames[KSMBD_WRITE_TX_FRAMES];
+-	struct ksmbd_transport_write tx;
++	struct ksmbd_write_tx_batch local_batch;
++	struct ksmbd_write_tx_batch *batch = &local_batch;
++	struct ksmbd_transport_write *tx = &batch->tx;
+ 	struct ksmbd_work *work;
+-	unsigned int done = 0, nr, i, j;
++	unsigned int done = 0, i, j;
++	unsigned int max_frames = conn->write_tx_rx_owner ?
++		1 : ARRAY_SIZE(batch->frames);
+ 	bool failed;
+ 	int ret;
+ 
+ 	for (;;) {
+ 		spin_lock(&conn->write_tx_lock);
++		/* The lockless pending check is only a wakeup hint. */
++		if (conn->write_tx_state != KSMBD_WRITE_TX_DRAINING) {
++			spin_unlock(&conn->write_tx_lock);
++			return;
++		}
+ 		if (list_empty(&conn->write_tx_list)) {
+-			conn->write_tx_active = false;
++			WRITE_ONCE(conn->write_tx_state, KSMBD_WRITE_TX_IDLE);
+ 			spin_unlock(&conn->write_tx_lock);
+-			/* Last conn access: teardown may now proceed. */
++			/* Sole owner-release site, including after a TX handoff. */
+ 			ksmbd_conn_r_count_dec(conn);
+ 			return;
+ 		}
+ 		if (done >= KSMBD_WRITE_TX_BUDGET) {
+ 			spin_unlock(&conn->write_tx_lock);
+-			/* Transfer the owner reference to the continuation. */
+-			ksmbd_requeue_write_tx(conn);
++			if (!conn->write_tx_rx_owner)
++				ksmbd_requeue_write_tx(conn);
+ 			return;
+ 		}
+ 		failed = conn->write_tx_failed;
+-		nr = 0;
++		batch->nr = 0;
+ 		/* Drain only already-completed frames; never wait to fill a batch. */
+-		while (!list_empty(&conn->write_tx_list) && nr < KSMBD_WRITE_TX_FRAMES) {
++		while (!list_empty(&conn->write_tx_list) &&
++		       batch->nr < max_frames) {
+ 			work = list_first_entry(&conn->write_tx_list,
+ 						struct ksmbd_work, write_tx_entry);
+ 			list_del_init(&work->write_tx_entry);
+-			frames[nr++] = work;
++			batch->frames[batch->nr++] = work;
+ 		}
+ 		spin_unlock(&conn->write_tx_lock);
+-
+ 		if (failed)
+ 			goto release_batch;
+-
+-		tx = (struct ksmbd_transport_write) { .iov = iov };
+-		for (i = 0; i < nr; i++) {
+-			work = frames[i];
+-			for (j = 0; j < work->iov_cnt; j++) {
+-				iov[tx.iov_cnt++] = work->iov[j];
+-				tx.size += work->iov[j].iov_len;
++		if (conn->write_tx_rx_owner) {
++			if (!ksmbd_try_send_rx_tx(conn, batch->frames[0]))
++				return;
++		} else {
++			*tx = (struct ksmbd_transport_write) { .iov = batch->iov };
++			for (i = 0; i < batch->nr; i++) {
++				work = batch->frames[i];
++				for (j = 0; j < work->iov_cnt; j++) {
++					batch->iov[tx->iov_cnt++] = work->iov[j];
++					tx->size += work->iov[j].iov_len;
++				}
+ 			}
++			/* TCP completes the whole stream or shuts it down. */
++			ksmbd_conn_lock(conn);
++			ret = conn->transport->ops->writev(conn->transport, tx);
++			ksmbd_conn_unlock(conn);
++			if (ret < 0)
++				ksmbd_write_tx_error(conn, ret);
+ 		}
+-		/* The original TCP loop completes the whole stream or shuts it down. */
+-		ksmbd_conn_lock(conn);
+-		ret = conn->transport->ops->writev(conn->transport, &tx);
+-		ksmbd_conn_unlock(conn);
+-		if (ret < 0) {
+-			pr_err("Failed to send WRITE responses: %d\n", ret);
+-			spin_lock(&conn->write_tx_lock);
+-			conn->write_tx_failed = true;
+-			spin_unlock(&conn->write_tx_lock);
+-		}
+-
+ release_batch:
+-		/* Failed connections still release queued work within the budget. */
+-		for (i = 0; i < nr; i++) {
+-			/* Its original callback releases the inline owner's own work. */
+-			if (frames[i] != inline_work)
+-				ksmbd_finish_work(frames[i]);
+-		}
+-		done += nr;
++		done += batch->nr;
++		ksmbd_release_write_batch(batch, inline_work);
+ 		cond_resched();
+ 	}
+ }
+ 
++static void ksmbd_resume_rx_tx(struct ksmbd_conn *conn)
++{
++	struct ksmbd_work *work = conn->write_tx_pending;
++	int ret;
++
++	/* TCP's existing writable wait runs here, never in the receiver. */
++	ksmbd_conn_lock(conn);
++	while (iov_iter_count(&conn->write_tx_iter)) {
++		ret = ksmbd_tcp_send_iter(conn->transport, &conn->write_tx_iter, 0);
++		if (ret <= 0) {
++			conn->transport->ops->shutdown(conn->transport);
++			ksmbd_write_tx_error(conn, ret ?: -EIO);
++			break;
++		}
++	}
++	ksmbd_conn_unlock(conn);
++	conn->write_tx_pending = NULL;
++	ksmbd_finish_work(work);
++	spin_lock(&conn->write_tx_lock);
++	WRITE_ONCE(conn->write_tx_state, KSMBD_WRITE_TX_DRAINING);
++	/* RX rechecks the queue under lock and releases the owner reference. */
++	ksmbd_wake_rx_tx(conn);
++	spin_unlock(&conn->write_tx_lock);
++}
++
+ static void ksmbd_write_tx_work(struct work_struct *wk)
+ {
+ 	struct ksmbd_conn *conn = container_of(wk, struct ksmbd_conn, write_tx_work);
+ 
+-	ksmbd_drain_write_tx(conn, NULL);
++	if (conn->write_tx_rx_owner)
++		ksmbd_resume_rx_tx(conn);
++	else
++		ksmbd_drain_write_tx(conn, NULL);
+ }
+ 
+ static void ksmbd_init_write_tx(struct ksmbd_conn *conn)
+@@ -612,6 +731,26 @@ static void ksmbd_init_write_tx(struct ksmbd_conn *conn)
+ 	spin_lock_init(&conn->write_tx_lock);
+ 	INIT_LIST_HEAD(&conn->write_tx_list);
+ 	INIT_WORK(&conn->write_tx_work, ksmbd_write_tx_work);
++	conn->write_tx_rx_owner = write_tx_rx_owner &&
++		ksmbd_transport_is_tcp(conn->transport);
++}
++
++void ksmbd_conn_drain_rx_tx(struct ksmbd_conn *conn)
++{
++	if (ksmbd_conn_rx_tx_pending(conn))
++		ksmbd_drain_write_tx(conn, NULL);
++}
++
++static void ksmbd_finish_rx_tx(struct ksmbd_conn *conn)
++{
++	if (!conn->write_tx_rx_owner)
++		return;
++	/* A receive EOF need not close the send half. Finish accepted requests. */
++	while (atomic_read(&conn->r_count)) {
++		ksmbd_conn_drain_rx_tx(conn);
++		wait_event(conn->r_count_q, !atomic_read(&conn->r_count) ||
++			   ksmbd_conn_rx_tx_pending(conn));
++	}
+ }
+ 
+ enum ksmbd_tx_result ksmbd_queue_write_response(struct ksmbd_work *work)
+@@ -626,13 +765,20 @@ enum ksmbd_tx_result ksmbd_queue_write_response(struct ksmbd_work *work)
+ 		spin_unlock(&conn->write_tx_lock);
+ 		return KSMBD_TX_RELEASE_WORK;
+ 	}
+-	if (!conn->write_tx_active) {
+-		conn->write_tx_active = true;
++	if (conn->write_tx_state == KSMBD_WRITE_TX_IDLE) {
++		WRITE_ONCE(conn->write_tx_state, KSMBD_WRITE_TX_DRAINING);
+ 		/* Retain transport/module lifetime across all drain continuations. */
+ 		ksmbd_conn_r_count_inc(conn);
+ 		owner = true;
+ 	}
+ 	list_add_tail(&work->write_tx_entry, &conn->write_tx_list);
++	if (conn->write_tx_rx_owner) {
++		/* Active RX drains again; a deferred batch wakes RX on completion. */
++		if (owner)
++			ksmbd_wake_rx_tx(conn);
++		spin_unlock(&conn->write_tx_lock);
++		return KSMBD_TX_WORK_TRANSFERRED;
++	}
+ 	spin_unlock(&conn->write_tx_lock);
+ 	if (!owner)
+ 		return KSMBD_TX_WORK_TRANSFERRED;
+@@ -672,7 +818,14 @@ static int __ksmbd_conn_write(struct ksmbd_work *work,
+ 	tx->need_invalidate_rkey = work->need_invalidate_rkey;
+ 	tx->remote_key = work->remote_key;
+ 
+-	ksmbd_conn_lock(conn);
++	for (;;) {
++		ksmbd_conn_lock(conn);
++		if (READ_ONCE(conn->write_tx_state) != KSMBD_WRITE_TX_DEFERRED)
++			break;
++		ksmbd_conn_unlock(conn);
++		wait_event(conn->req_running_q,
++			   READ_ONCE(conn->write_tx_state) != KSMBD_WRITE_TX_DEFERRED);
++	}
+ 	sent = conn->transport->ops->writev(conn->transport, tx);
+ 	ksmbd_conn_unlock(conn);
+ 
+@@ -794,7 +947,19 @@ int ksmbd_conn_handler_loop(void *p)
+ 		conn->request_buf = NULL;
+ 
+ recheck:
++		if (conn->write_tx_rx_owner && !ksmbd_conn_alive(conn))
++			break;
+ 		if (atomic_read(&conn->req_running) + 1 > max_req) {
++			if (conn->write_tx_rx_owner) {
++				/* TX completion must also release admission pressure. */
++				ksmbd_conn_drain_rx_tx(conn);
++				if (wait_event_interruptible_timeout(conn->req_running_q,
++					atomic_read(&conn->req_running) < max_req ||
++					ksmbd_conn_rx_tx_pending(conn) ||
++					!ksmbd_conn_alive(conn), HZ) < 0)
++					break;
++				goto recheck;
++			}
+ 			wait_event_interruptible(conn->req_running_q,
+ 				atomic_read(&conn->req_running) < max_req);
+ 			goto recheck;
+@@ -889,6 +1054,7 @@ int ksmbd_conn_handler_loop(void *p)
+ 
+ 	ksmbd_conn_set_releasing(conn);
+ 	ksmbd_conn_cancel_async_requests(conn);
++	ksmbd_finish_rx_tx(conn);
+ 	/* Wait till all reference dropped to the Server object*/
+ 	ksmbd_debug(CONN, "Wait for all pending requests(%d)\n", atomic_read(&conn->r_count));
+ 	wait_event(conn->r_count_q, atomic_read(&conn->r_count) == 0);
+diff --git a/fs/smb/server/connection.h b/fs/smb/server/connection.h
+index 6432e4f125e4..eec2125494b8 100644
+--- a/fs/smb/server/connection.h
++++ b/fs/smb/server/connection.h
+@@ -18,6 +18,7 @@
+ #include <linux/unicode.h>
+ #include <linux/workqueue.h>
+ #include <linux/bitmap.h>
++#include <linux/uio.h>
+ 
+ #include "smb_common.h"
+ #include "ksmbd_work.h"
+@@ -53,6 +54,12 @@ struct ksmbd_conn_stats {
+ 
+ struct ksmbd_transport;
+ 
++enum ksmbd_write_tx_state {
++	KSMBD_WRITE_TX_IDLE,
++	KSMBD_WRITE_TX_DRAINING,
++	KSMBD_WRITE_TX_DEFERRED,
++};
++
+ struct ksmbd_conn {
+ 	struct smb_version_values	*vals;
+ 	struct smb_version_ops		*ops;
+@@ -63,8 +70,11 @@ struct ksmbd_conn {
+ 	spinlock_t			write_tx_lock;
+ 	struct list_head		write_tx_list;
+ 	struct work_struct		write_tx_work;
+-	bool				write_tx_active;
++	/* Non-idle states retain one TX owner reference. */
++	enum ksmbd_write_tx_state	write_tx_state;
+ 	bool				write_tx_failed;
++	bool				write_tx_rx_owner;
++	struct ksmbd_work		*write_tx_pending;
+ 	/* RX-only: keep WRITEs per-CPU until idle is observed. */
+ 	bool				write_wq_blocked;
+ 	/* Sticky across channel removal; accessed with READ/WRITE_ONCE. */
+@@ -166,6 +176,8 @@ struct ksmbd_conn {
+ 	bool				aapl_readdir_attr; /* READDIR_ATTR negotiated */
+ 	bool				aapl_readdir_attr_v2; /* V2 specifically */
+ 	struct work_struct		release_work;
++	/* Backing iov belongs to write_tx_pending during deferred sending. */
++	struct iov_iter			write_tx_iter;
+ };
+ 
+ struct ksmbd_conn_ops {
+@@ -249,6 +261,14 @@ void ksmbd_conn_lock(struct ksmbd_conn *conn);
+ void ksmbd_conn_unlock(struct ksmbd_conn *conn);
+ void ksmbd_conn_r_count_inc(struct ksmbd_conn *conn);
+ void ksmbd_conn_r_count_dec(struct ksmbd_conn *conn);
++void ksmbd_conn_drain_rx_tx(struct ksmbd_conn *conn);
++
++static inline bool ksmbd_conn_rx_tx_pending(struct ksmbd_conn *conn)
++{
++	/* Wakeup hint only; the drain revalidates ownership under write_tx_lock. */
++	return conn->write_tx_rx_owner &&
++		READ_ONCE(conn->write_tx_state) == KSMBD_WRITE_TX_DRAINING;
++}
+ 
+ /*
+  * WARNING
+diff --git a/fs/smb/server/transport_tcp.c b/fs/smb/server/transport_tcp.c
+index 0a4328285f50..53a3220eff97 100644
+--- a/fs/smb/server/transport_tcp.c
++++ b/fs/smb/server/transport_tcp.c
+@@ -373,6 +373,9 @@ static int ksmbd_tcp_readv(struct tcp_transport *t, struct kvec *iov_orig,
+ 	struct msghdr ksmbd_msg;
+ 	struct kvec *iov;
+ 	struct ksmbd_conn *conn = KSMBD_TRANS(t)->conn;
++	struct sock *sk = t->sock->sk;
++	long timeo = READ_ONCE(sk->sk_rcvtimeo), remaining, waited;
++	unsigned long deadline = jiffies + timeo, now;
+ 
+ 	iov = get_conn_iovec(t, nr_segs);
+ 	if (!iov)
+@@ -388,11 +391,41 @@ static int ksmbd_tcp_readv(struct tcp_transport *t, struct kvec *iov_orig,
+ 			total_read = -ESHUTDOWN;
+ 			break;
+ 		}
++		ksmbd_conn_drain_rx_tx(conn);
+ 		segs = kvec_array_init(iov, iov_orig, nr_segs, total_read);
+ 
+ 		length = kernel_recvmsg(t->sock, &ksmbd_msg,
+-					iov, segs, to_read, 0);
++					iov, segs, to_read,
++					conn->write_tx_rx_owner ? MSG_DONTWAIT : 0);
++
++		if (length == -EAGAIN && conn->write_tx_rx_owner) {
++			/* TX events must not restart a receive attempt's timeout. */
++			now = jiffies;
++			remaining = timeo;
++			if (timeo != MAX_SCHEDULE_TIMEOUT)
++				remaining = time_before(now, deadline) ? deadline - now : 0;
++			if (!remaining)
++				goto recv_retry;
++			waited = wait_event_interruptible_timeout(*sk_sleep(sk),
++								  ksmbd_conn_rx_tx_pending(conn) ||
++								  tcp_epollin_ready(sk, 1) ||
++								  READ_ONCE(sk->sk_err) ||
++								  (READ_ONCE(sk->sk_shutdown) &
++								   RCV_SHUTDOWN) ||
++								  !ksmbd_conn_alive(conn),
++								  remaining);
++			if (waited > 0) {
++				/* Completion wakeups do not consume receive retries. */
++				length = 0;
++				continue;
++			}
++			if (waited < 0) {
++				total_read = -ESHUTDOWN;
++				break;
++			}
++		}
+ 
++recv_retry:
+ 		if (length == -EINTR) {
+ 			total_read = -ESHUTDOWN;
+ 			break;
+@@ -412,12 +445,15 @@ static int ksmbd_tcp_readv(struct tcp_transport *t, struct kvec *iov_orig,
+ 			}
+ 
+ 			usleep_range(1000, 2000);
++			deadline = jiffies + timeo;
+ 			length = 0;
+ 			continue;
+ 		} else if (length <= 0) {
+ 			total_read = length;
+ 			break;
+ 		}
++		/* Positive receive progress starts the next receive attempt. */
++		deadline = jiffies + timeo;
+ 	}
+ 	return total_read;
+ }
+@@ -468,6 +504,21 @@ static void *ksmbd_tcp_build_splice_header(struct tcp_transport *t,
+ 	return header_frag;
+ }
+ 
++/* The caller serializes the frame and retains iter's backing buffers. */
++int ksmbd_tcp_send_iter(struct ksmbd_transport *t, struct iov_iter *iter,
++			int flags)
++{
++	struct msghdr msg = {
++		.msg_flags = MSG_NOSIGNAL | flags,
++		.msg_iter = *iter,
++	};
++	int ret;
++
++	ret = sock_sendmsg(TCP_TRANS(t)->sock, &msg);
++	*iter = msg.msg_iter;
++	return ret;
++}
++
+ static int ksmbd_tcp_writev(struct ksmbd_transport *t,
+ 			    const struct ksmbd_transport_write *tx)
+ {
+@@ -517,6 +568,11 @@ static void ksmbd_tcp_shutdown(struct ksmbd_transport *t)
+ 	kernel_sock_shutdown(TCP_TRANS(t)->sock, SHUT_RDWR);
+ }
+ 
++void ksmbd_tcp_wake_rx(struct ksmbd_transport *t)
++{
++	wake_up_interruptible_all(sk_sleep(TCP_TRANS(t)->sock->sk));
++}
++
+ static void tcp_destroy_socket(struct socket *ksmbd_socket)
+ {
+ 	int ret;
+diff --git a/fs/smb/server/transport_tcp.h b/fs/smb/server/transport_tcp.h
+index d466fa4d8b4e..0e07513fe0a7 100644
+--- a/fs/smb/server/transport_tcp.h
++++ b/fs/smb/server/transport_tcp.h
+@@ -6,11 +6,16 @@
+ #ifndef __KSMBD_TRANSPORT_TCP_H__
+ #define __KSMBD_TRANSPORT_TCP_H__
+ 
++struct iov_iter;
++
+ int ksmbd_tcp_set_interfaces(char *ifc_list, int ifc_list_sz);
+ struct interface *ksmbd_find_netdev_name_iface_list(char *netdev_name);
+ void ksmbd_free_transport(struct ksmbd_transport *kt);
+ bool ksmbd_transport_is_tcp(struct ksmbd_transport *t);
+ bool ksmbd_tcp_rx_ready(struct ksmbd_transport *t);
++void ksmbd_tcp_wake_rx(struct ksmbd_transport *t);
++int ksmbd_tcp_send_iter(struct ksmbd_transport *t, struct iov_iter *iter,
++			int flags);
+ int ksmbd_tcp_init(void);
+ void ksmbd_tcp_destroy(void);
+ 

@@ -1,0 +1,12 @@
+Current dev_ksmbd RFC snapshot, 2026-11-04
+
+Eight patches in the agreed order: TCP send completion; READ splice; workqueue exports; WRITE routing; startup configuration; worker response coalescing; adaptive placement; RX-owned sending.
+
+The export folds the two working-tree RX simplification files into patch8. Kernel branch HEAD remains 997db9441583b7909e3a87266aa21c7b65615ec0 and the two source edits remain uncommitted for review. The complete applied tree is a91c84a6d67ed46a60ab547f3b375f8c1dd91ea3.
+
+Apply on base e1253a82bb4c0fed6706a5839fc8b6e01be1abe2:
+  git am /path/to/RFCV2-1104/000[1-8]-*.patch
+
+The series was applied to a temporary index and the resulting tree matched the current working tree. Module and source hashes are in manifest.json. build/boot settings and full raw samples remain in the experiment archives.
+
+Validation summary: short-results.txt. The initial 4K outlier remains recorded; latest adaptive on/off testing is pending.
